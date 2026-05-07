@@ -1,0 +1,14 @@
+# Build outputs
+/build/
+/build_*/
+
+# CMake user/package metadata
+CMakeUserPresets.json
+
+# Editor and local metadata
+/.vs/
+/.vscode/
+/.idea/
+
+# Windows artifacts
+/nul
