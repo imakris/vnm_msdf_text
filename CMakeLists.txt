@@ -177,13 +177,68 @@ endif()
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   include(GNUInstallDirs)
+  include(CMakePackageConfigHelpers)
+
+  # install(EXPORT) requires every PUBLIC link dependency to be either
+  # IMPORTED or part of an installed export set. msdfgen/Freetype only
+  # satisfy that when VNM_MSDF_TEXT_USE_SYSTEM_LIBS=ON brought them in via
+  # find_package; in the FetchContent path they are locally-built targets,
+  # so we install headers and the library archive but skip the export.
+  set(_vnm_msdf_text_export_ok TRUE)
+  foreach(_dep IN ITEMS Freetype::Freetype msdfgen::msdfgen-core msdfgen::msdfgen-ext)
+    if(TARGET ${_dep})
+      get_target_property(_dep_imported ${_dep} IMPORTED)
+      if(NOT _dep_imported)
+        set(_vnm_msdf_text_export_ok FALSE)
+      endif()
+    endif()
+  endforeach()
+
   install(DIRECTORY include/vnm_msdf_text
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
   )
-  install(TARGETS vnm_msdf_text
-    EXPORT vnm_msdf_textTargets
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-  )
+
+  if(_vnm_msdf_text_export_ok)
+    install(TARGETS vnm_msdf_text
+      EXPORT vnm_msdf_textTargets
+      LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+      INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
+
+    install(EXPORT vnm_msdf_textTargets
+      NAMESPACE vnm_msdf_text::
+      DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vnm_msdf_text
+    )
+
+    write_basic_package_version_file(
+      "${CMAKE_CURRENT_BINARY_DIR}/vnm_msdf_text-config-version.cmake"
+      VERSION ${PROJECT_VERSION}
+      COMPATIBILITY SameMajorVersion
+    )
+
+    configure_package_config_file(
+      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vnm_msdf_text-config.cmake.in"
+      "${CMAKE_CURRENT_BINARY_DIR}/vnm_msdf_text-config.cmake"
+      INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vnm_msdf_text
+    )
+
+    install(FILES
+      "${CMAKE_CURRENT_BINARY_DIR}/vnm_msdf_text-config.cmake"
+      "${CMAKE_CURRENT_BINARY_DIR}/vnm_msdf_text-config-version.cmake"
+      DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vnm_msdf_text
+    )
+  else()
+    install(TARGETS vnm_msdf_text
+      LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+    message(STATUS
+      "vnm_msdf_text: Skipping find_package export because Freetype/msdfgen are "
+      "built locally via FetchContent. Configure with "
+      "-DVNM_MSDF_TEXT_USE_SYSTEM_LIBS=ON (and have those packages "
+      "find_package-able) to install a find_package-ready vnm_msdf_text.")
+  endif()
 endif()

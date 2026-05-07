@@ -1,0 +1,10 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(Freetype)
+find_dependency(msdfgen)
+
+include("${CMAKE_CURRENT_LIST_DIR}/vnm_msdf_textTargets.cmake")
+
+check_required_components(vnm_msdf_text)
