@@ -62,7 +62,12 @@ elseif(TARGET freetype)
   add_library(Freetype::Freetype ALIAS freetype)
   message(STATUS "vnm_msdf_text: Using existing freetype target")
 else()
-  message(STATUS "vnm_msdf_text: Fetching freetype")
+  if(FETCHCONTENT_SOURCE_DIR_FREETYPE AND
+     EXISTS "${FETCHCONTENT_SOURCE_DIR_FREETYPE}/CMakeLists.txt")
+    message(STATUS "vnm_msdf_text: Using local freetype checkout: ${FETCHCONTENT_SOURCE_DIR_FREETYPE}")
+  else()
+    message(STATUS "vnm_msdf_text: Fetching freetype")
+  endif()
   vnm_msdf_text_set_fetchcontent_build_dir(freetype freetype)
   FetchContent_Declare(freetype
     GIT_REPOSITORY https://gitlab.freedesktop.org/freetype/freetype.git
@@ -87,7 +92,12 @@ endif()
 if(TARGET msdfgen::msdfgen-core AND TARGET msdfgen::msdfgen-ext)
   message(STATUS "vnm_msdf_text: Using existing msdfgen targets")
 else()
-  message(STATUS "vnm_msdf_text: Fetching msdfgen")
+  if(FETCHCONTENT_SOURCE_DIR_MSDFGEN AND
+     EXISTS "${FETCHCONTENT_SOURCE_DIR_MSDFGEN}/CMakeLists.txt")
+    message(STATUS "vnm_msdf_text: Using local msdfgen checkout: ${FETCHCONTENT_SOURCE_DIR_MSDFGEN}")
+  else()
+    message(STATUS "vnm_msdf_text: Fetching msdfgen")
+  endif()
   vnm_msdf_text_set_fetchcontent_build_dir(msdfgen msdfgen)
   FetchContent_Declare(msdfgen
     GIT_REPOSITORY https://github.com/Chlumsky/msdfgen.git
