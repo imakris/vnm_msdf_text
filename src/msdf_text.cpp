@@ -128,6 +128,35 @@ build_result_t failure(const std::string& message)
     return result;
 }
 
+template <class Visitor>
+float for_each_positioned_glyph(
+    const atlas_t& atlas,
+    const char* data,
+    std::size_t size,
+    float start_x,
+    Visitor&& visit)
+{
+    float pen_x = start_x;
+    char32_t previous = 0;
+    const auto codepoints = utf8_to_codepoints(data, size);
+    for (char32_t codepoint : codepoints) {
+        const auto glyph_it = atlas.glyphs.find(codepoint);
+        if (glyph_it == atlas.glyphs.end()) {
+            continue;
+        }
+        if (previous != 0) {
+            const auto kerning_it = atlas.kerning_px.find(kerning_key_t{previous, codepoint});
+            if (kerning_it != atlas.kerning_px.end()) {
+                pen_x += kerning_it->second;
+            }
+        }
+        visit(pen_x, glyph_it->second);
+        pen_x += glyph_it->second.advance_x;
+        previous = codepoint;
+    }
+    return pen_x;
+}
+
 } // namespace
 
 std::size_t kerning_key_hash_t::operator()(const kerning_key_t& key) const
@@ -428,24 +457,9 @@ build_result_t build_font_atlas(
 
 float measure_text_px(const atlas_t& atlas, const char* data, std::size_t size)
 {
-    float x = 0.0f;
-    char32_t previous = 0;
-    const auto codepoints = utf8_to_codepoints(data, size);
-    for (char32_t codepoint : codepoints) {
-        const auto glyph_it = atlas.glyphs.find(codepoint);
-        if (glyph_it == atlas.glyphs.end()) {
-            continue;
-        }
-        if (previous != 0) {
-            const auto kerning_it = atlas.kerning_px.find(kerning_key_t{previous, codepoint});
-            if (kerning_it != atlas.kerning_px.end()) {
-                x += kerning_it->second;
-            }
-        }
-        x += glyph_it->second.advance_x;
-        previous = codepoint;
-    }
-    return x;
+    return for_each_positioned_glyph(
+        atlas, data, size, 0.0f,
+        [](float, const glyph_t&) {});
 }
 
 float measure_text_px(const atlas_t& atlas, const char* data)
@@ -462,51 +476,34 @@ void append_text_quads(
     std::vector<text_vertex_t>& vertices,
     std::vector<std::uint32_t>* indices)
 {
-    float pen_x = x;
-    char32_t previous = 0;
-    const auto codepoints = utf8_to_codepoints(data, size);
-    for (char32_t codepoint : codepoints) {
-        const auto glyph_it = atlas.glyphs.find(codepoint);
-        if (glyph_it == atlas.glyphs.end()) {
-            continue;
-        }
+    for_each_positioned_glyph(
+        atlas, data, size, x,
+        [&](float pen_x, const glyph_t& glyph) {
+            const float x0 = pen_x + glyph.plane_left;
+            const float x1 = pen_x + glyph.plane_right;
+            const float y0 = y + glyph.plane_bottom;
+            const float y1 = y + glyph.plane_top;
+            const float s_min = std::min(glyph.uv_left, glyph.uv_right);
+            const float s_max = std::max(glyph.uv_left, glyph.uv_right);
+            const float t_min = std::min(glyph.uv_top, glyph.uv_bottom);
+            const float t_max = std::max(glyph.uv_top, glyph.uv_bottom);
 
-        if (previous != 0) {
-            const auto kerning_it = atlas.kerning_px.find(kerning_key_t{previous, codepoint});
-            if (kerning_it != atlas.kerning_px.end()) {
-                pen_x += kerning_it->second;
+            const std::uint32_t base =
+                static_cast<std::uint32_t>(vertices.size());
+            vertices.push_back({x0, y0, glyph.uv_left,  glyph.uv_bottom, s_min, t_min, s_max, t_max});
+            vertices.push_back({x0, y1, glyph.uv_left,  glyph.uv_top,    s_min, t_min, s_max, t_max});
+            vertices.push_back({x1, y1, glyph.uv_right, glyph.uv_top,    s_min, t_min, s_max, t_max});
+            vertices.push_back({x1, y0, glyph.uv_right, glyph.uv_bottom, s_min, t_min, s_max, t_max});
+
+            if (indices) {
+                indices->push_back(base);
+                indices->push_back(base + 1);
+                indices->push_back(base + 2);
+                indices->push_back(base);
+                indices->push_back(base + 2);
+                indices->push_back(base + 3);
             }
-        }
-
-        const glyph_t& glyph = glyph_it->second;
-        const float x0 = pen_x + glyph.plane_left;
-        const float x1 = pen_x + glyph.plane_right;
-        const float y0 = y + glyph.plane_bottom;
-        const float y1 = y + glyph.plane_top;
-        const float s_min = std::min(glyph.uv_left, glyph.uv_right);
-        const float s_max = std::max(glyph.uv_left, glyph.uv_right);
-        const float t_min = std::min(glyph.uv_top, glyph.uv_bottom);
-        const float t_max = std::max(glyph.uv_top, glyph.uv_bottom);
-
-        const std::uint32_t base =
-            static_cast<std::uint32_t>(vertices.size());
-        vertices.push_back({x0, y0, glyph.uv_left,  glyph.uv_bottom, s_min, t_min, s_max, t_max});
-        vertices.push_back({x0, y1, glyph.uv_left,  glyph.uv_top,    s_min, t_min, s_max, t_max});
-        vertices.push_back({x1, y1, glyph.uv_right, glyph.uv_top,    s_min, t_min, s_max, t_max});
-        vertices.push_back({x1, y0, glyph.uv_right, glyph.uv_bottom, s_min, t_min, s_max, t_max});
-
-        if (indices) {
-            indices->push_back(base);
-            indices->push_back(base + 1);
-            indices->push_back(base + 2);
-            indices->push_back(base);
-            indices->push_back(base + 2);
-            indices->push_back(base + 3);
-        }
-
-        pen_x += glyph.advance_x;
-        previous = codepoint;
-    }
+        });
 }
 
 void append_text_quads(
