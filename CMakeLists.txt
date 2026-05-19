@@ -156,7 +156,7 @@ target_include_directories(vnm_msdf_text
     $<INSTALL_INTERFACE:include>
 )
 
-target_compile_features(vnm_msdf_text PUBLIC cxx_std_14)
+target_compile_features(vnm_msdf_text PUBLIC cxx_std_20)
 
 target_link_libraries(vnm_msdf_text
   PUBLIC
