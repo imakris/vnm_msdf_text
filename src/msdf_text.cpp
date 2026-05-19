@@ -248,7 +248,7 @@ build_result_t build_font_atlas(
     const std::uint8_t* font_data,
     std::size_t font_size,
     int pixel_height,
-    const std::vector<char32_t>& codepoints,
+    std::span<const char32_t> codepoints,
     const options_t& options,
     const log_callback_t& log_debug)
 {
