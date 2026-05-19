@@ -159,18 +159,6 @@ float for_each_positioned_glyph(
 
 } // namespace
 
-std::size_t kerning_key_hash_t::operator()(const kerning_key_t& key) const
-{
-    const std::size_t left = static_cast<std::size_t>(key.left);
-    const std::size_t right = static_cast<std::size_t>(key.right);
-    return left ^ (right + 0x9E3779B9u + (left << 6) + (left >> 2));
-}
-
-bool kerning_key_equal_t::operator()(const kerning_key_t& a, const kerning_key_t& b) const
-{
-    return a.left == b.left && a.right == b.right;
-}
-
 std::vector<char32_t> default_codepoints()
 {
     static const std::vector<char32_t> codepoints = [] {

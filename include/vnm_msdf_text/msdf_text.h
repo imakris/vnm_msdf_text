@@ -27,24 +27,29 @@ struct kerning_key_t
 {
     char32_t left  = 0;
     char32_t right = 0;
+
+    bool operator==(const kerning_key_t&) const = default;
 };
 
-struct kerning_key_hash_t
+} // namespace msdf_text
+} // namespace vnm
+
+template <>
+struct std::hash<vnm::msdf_text::kerning_key_t>
 {
-    std::size_t operator()(const kerning_key_t& key) const;
+    std::size_t operator()(const vnm::msdf_text::kerning_key_t& key) const noexcept
+    {
+        const std::size_t left  = static_cast<std::size_t>(key.left);
+        const std::size_t right = static_cast<std::size_t>(key.right);
+        return left ^ (right + 0x9E3779B9u + (left << 6) + (left >> 2));
+    }
 };
 
-struct kerning_key_equal_t
-{
-    bool operator()(const kerning_key_t& a, const kerning_key_t& b) const;
-};
+namespace vnm {
+namespace msdf_text {
 
-using glyph_map_t = std::unordered_map<char32_t, glyph_t>;
-using kerning_map_t = std::unordered_map<
-    kerning_key_t,
-    float,
-    kerning_key_hash_t,
-    kerning_key_equal_t>;
+using glyph_map_t   = std::unordered_map<char32_t, glyph_t>;
+using kerning_map_t = std::unordered_map<kerning_key_t, float>;
 
 struct atlas_t
 {
