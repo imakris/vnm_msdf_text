@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -96,8 +97,7 @@ using log_callback_t = std::function<void(const std::string&)>;
 
 std::vector<char32_t> default_codepoints();
 
-std::vector<char32_t> utf8_to_codepoints(const char* data, std::size_t size);
-std::vector<char32_t> utf8_to_codepoints(const char* data);
+std::vector<char32_t> utf8_to_codepoints(std::string_view text);
 std::string codepoints_to_utf8(const std::vector<char32_t>& codepoints);
 
 build_result_t build_font_atlas(
@@ -108,21 +108,11 @@ build_result_t build_font_atlas(
     const options_t& options = options_t(),
     const log_callback_t& log_debug = log_callback_t());
 
-float measure_text_px(const atlas_t& atlas, const char* data, std::size_t size);
-float measure_text_px(const atlas_t& atlas, const char* data);
+float measure_text_px(const atlas_t& atlas, std::string_view text);
 
 void append_text_quads(
     const atlas_t& atlas,
-    const char* data,
-    std::size_t size,
-    float x,
-    float y,
-    std::vector<text_vertex_t>& vertices,
-    std::vector<std::uint32_t>* indices = nullptr);
-
-void append_text_quads(
-    const atlas_t& atlas,
-    const char* data,
+    std::string_view text,
     float x,
     float y,
     std::vector<text_vertex_t>& vertices,

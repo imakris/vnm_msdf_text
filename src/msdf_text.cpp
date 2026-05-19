@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 #include <limits>
 
 namespace vnm {
@@ -114,7 +113,7 @@ std::size_t codepoint_to_utf8(char32_t codepoint, char* out)
     return 0;
 }
 
-void append_utf8(std::vector<char32_t>& chars, const char* utf8)
+void append_utf8(std::vector<char32_t>& chars, std::string_view utf8)
 {
     const auto decoded = utf8_to_codepoints(utf8);
     chars.insert(chars.end(), decoded.begin(), decoded.end());
@@ -131,14 +130,13 @@ build_result_t failure(const std::string& message)
 template <class Visitor>
 float for_each_positioned_glyph(
     const atlas_t& atlas,
-    const char* data,
-    std::size_t size,
+    std::string_view text,
     float start_x,
     Visitor&& visit)
 {
     float pen_x = start_x;
     char32_t previous = 0;
-    const auto codepoints = utf8_to_codepoints(data, size);
+    const auto codepoints = utf8_to_codepoints(text);
     for (char32_t codepoint : codepoints) {
         const auto glyph_it = atlas.glyphs.find(codepoint);
         if (glyph_it == atlas.glyphs.end()) {
@@ -219,25 +217,16 @@ std::vector<char32_t> default_codepoints()
     return codepoints;
 }
 
-std::vector<char32_t> utf8_to_codepoints(const char* data, std::size_t size)
+std::vector<char32_t> utf8_to_codepoints(std::string_view text)
 {
     std::vector<char32_t> result;
-    if (!data) {
-        return result;
-    }
-
-    result.reserve(size);
-    const char* it = data;
-    const char* end = data + size;
+    result.reserve(text.size());
+    const char* it = text.data();
+    const char* end = it + text.size();
     while (it < end) {
         result.push_back(utf8_decode_one(it, end));
     }
     return result;
-}
-
-std::vector<char32_t> utf8_to_codepoints(const char* data)
-{
-    return data ? utf8_to_codepoints(data, std::strlen(data)) : std::vector<char32_t>();
 }
 
 std::string codepoints_to_utf8(const std::vector<char32_t>& codepoints)
@@ -443,29 +432,23 @@ build_result_t build_font_atlas(
     return result;
 }
 
-float measure_text_px(const atlas_t& atlas, const char* data, std::size_t size)
+float measure_text_px(const atlas_t& atlas, std::string_view text)
 {
     return for_each_positioned_glyph(
-        atlas, data, size, 0.0f,
+        atlas, text, 0.0f,
         [](float, const glyph_t&) {});
-}
-
-float measure_text_px(const atlas_t& atlas, const char* data)
-{
-    return data ? measure_text_px(atlas, data, std::strlen(data)) : 0.0f;
 }
 
 void append_text_quads(
     const atlas_t& atlas,
-    const char* data,
-    std::size_t size,
+    std::string_view text,
     float x,
     float y,
     std::vector<text_vertex_t>& vertices,
     std::vector<std::uint32_t>* indices)
 {
     for_each_positioned_glyph(
-        atlas, data, size, x,
+        atlas, text, x,
         [&](float pen_x, const glyph_t& glyph) {
             const float x0 = pen_x + glyph.plane_left;
             const float x1 = pen_x + glyph.plane_right;
@@ -492,20 +475,6 @@ void append_text_quads(
                 indices->push_back(base + 3);
             }
         });
-}
-
-void append_text_quads(
-    const atlas_t& atlas,
-    const char* data,
-    float x,
-    float y,
-    std::vector<text_vertex_t>& vertices,
-    std::vector<std::uint32_t>* indices)
-{
-    if (!data) {
-        return;
-    }
-    append_text_quads(atlas, data, std::strlen(data), x, y, vertices, indices);
 }
 
 } // namespace msdf_text
