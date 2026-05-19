@@ -220,6 +220,9 @@ std::vector<char32_t> default_codepoints()
 std::vector<char32_t> utf8_to_codepoints(std::string_view text)
 {
     std::vector<char32_t> result;
+    if (text.empty()) {
+        return result;
+    }
     result.reserve(text.size());
     const char* it = text.data();
     const char* end = it + text.size();
