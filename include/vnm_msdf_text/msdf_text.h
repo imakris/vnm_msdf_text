@@ -99,10 +99,7 @@ struct options_t
      */
     double min_atlas_font_size = 48.0;
     /**
-     * @brief Baked distance range in atlas pixels.
-     *
-     * build_font_atlas converts this value to shape units before calling
-     * msdfgen.
+     * @brief Baked distance range passed to msdfgen in atlas pixels.
      */
     float atlas_px_range = 2.0f;
     /**

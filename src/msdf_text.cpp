@@ -18,7 +18,6 @@ namespace msdf_text {
 namespace {
 
 constexpr char32_t k_replacement_char = 0xFFFD;
-constexpr msdfgen::FontCoordinateScaling k_font_scaling = msdfgen::FONT_SCALING_EM_NORMALIZED;
 
 bool is_continuation(unsigned char c)
 {
@@ -435,7 +434,9 @@ build_result_t build_font_atlas(
     }
 
     msdfgen::FontMetrics metrics{};
-    if (!msdfgen::getFontMetrics(metrics, font_handle.get(), k_font_scaling)) {
+    // Keep the msdfgen default font-coordinate scaling: the atlas projection,
+    // plane rectangles, and shader px_range are calibrated as one unit.
+    if (!msdfgen::getFontMetrics(metrics, font_handle.get())) {
         return failure("Failed to query font metrics for msdfgen");
     }
     if (!is_finite_positive(metrics.ascenderY) ||
@@ -562,7 +563,6 @@ build_result_t build_font_atlas(
                 shape,
                 font_handle.get(),
                 group.glyph_index,
-                k_font_scaling,
                 &advance))
         {
             append_codepoints(result.failed_codepoints, group.codepoints);
@@ -574,7 +574,6 @@ build_result_t build_font_atlas(
         }
 
         if (shape.edgeCount() > 0) {
-            shape.normalize();
             msdfgen::edgeColoringSimple(shape, 3.0, 0);
         }
 
@@ -679,11 +678,7 @@ build_result_t build_font_atlas(
             -job.bounds.l + (atlas_px_range / bitmap_scale),
             -job.bounds.b + (atlas_px_range / bitmap_scale));
         const msdfgen::Projection projection(msdf_scale, msdf_translate);
-        const msdfgen::Range shape_range(atlas_px_range / bitmap_scale);
-        const msdfgen::SDFTransformation transform(
-            projection,
-            msdfgen::DistanceMapping(shape_range));
-        msdfgen::generateMTSDF(bitmap, job.shape, transform);
+        msdfgen::generateMTSDF(bitmap, job.shape, projection, options.atlas_px_range);
 
         for (int y = 0; y < job.bitmap_h; ++y) {
             for (int x = 0; x < job.bitmap_w; ++x) {
@@ -743,8 +738,7 @@ build_result_t build_font_atlas(
                         k,
                         font_handle.get(),
                         left.glyph_index,
-                        right.glyph_index,
-                        k_font_scaling))
+                        right.glyph_index))
                 {
                     const float kern_px = static_cast<float>(k * draw_scale);
                     if (kern_px != 0.0f) {
