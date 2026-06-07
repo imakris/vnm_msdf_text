@@ -6,11 +6,37 @@ project(vnm_msdf_text
   LANGUAGES CXX
 )
 
-option(VNM_MSDF_TEXT_USE_SYSTEM_LIBS
-  "Prefer system/precompiled FreeType and msdfgen over FetchContent"
-  OFF)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  set(VNM_MSDF_TEXT_IS_TOP_LEVEL ON)
+else()
+  set(VNM_MSDF_TEXT_IS_TOP_LEVEL OFF)
+endif()
+
+set(_vnm_msdf_text_fetch_deps_default ${VNM_MSDF_TEXT_IS_TOP_LEVEL})
+if(DEFINED VNM_MSDF_TEXT_USE_SYSTEM_LIBS AND
+   NOT DEFINED VNM_MSDF_TEXT_FETCH_DEPS)
+  if(VNM_MSDF_TEXT_USE_SYSTEM_LIBS)
+    set(_vnm_msdf_text_fetch_deps_default OFF)
+  else()
+    set(_vnm_msdf_text_fetch_deps_default ON)
+  endif()
+endif()
+
+option(VNM_MSDF_TEXT_FETCH_DEPS
+  "Fetch/build FreeType and msdfgen when they are not already available"
+  ${_vnm_msdf_text_fetch_deps_default})
+option(VNM_MSDF_TEXT_BUILD_TESTS
+  "Build vnm_msdf_text tests"
+  ${VNM_MSDF_TEXT_IS_TOP_LEVEL})
 
 include(FetchContent)
+
+if(DEFINED VNM_MSDF_TEXT_USE_SYSTEM_LIBS)
+  message(STATUS
+    "VNM_MSDF_TEXT_USE_SYSTEM_LIBS is deprecated. Use "
+    "VNM_MSDF_TEXT_FETCH_DEPS=OFF to require existing/find_package "
+    "dependencies, or VNM_MSDF_TEXT_FETCH_DEPS=ON to allow FetchContent.")
+endif()
 
 function(vnm_msdf_text_set_fetchcontent_build_dir name dir_name)
   string(TOLOWER "${CMAKE_CXX_COMPILER_ID}" _fc_compiler_tag)
@@ -25,46 +51,62 @@ function(vnm_msdf_text_set_fetchcontent_build_dir name dir_name)
     CACHE PATH "" FORCE)
 endfunction()
 
-set(VNM_MSDF_TEXT_DEFAULT_FONT_FILE
-  "${CMAKE_CURRENT_SOURCE_DIR}/fonts/monospace.ttf"
-  CACHE FILEPATH "Default MSDF text font file")
-get_filename_component(VNM_MSDF_TEXT_DEFAULT_FONT_DIR
-  "${VNM_MSDF_TEXT_DEFAULT_FONT_FILE}"
-  DIRECTORY)
+function(vnm_msdf_text_alias_freetype_target)
+  if(TARGET freetype AND NOT TARGET Freetype::Freetype)
+    add_library(Freetype::Freetype ALIAS freetype)
+  endif()
+endfunction()
 
-include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/workspace_deps_overrides.cmake OPTIONAL)
-if(VNM_MSDF_TEXT_DEP_OVERRIDES_FILE AND EXISTS "${VNM_MSDF_TEXT_DEP_OVERRIDES_FILE}")
-  message(STATUS "vnm_msdf_text: Loading dependency overrides from ${VNM_MSDF_TEXT_DEP_OVERRIDES_FILE}")
-  include("${VNM_MSDF_TEXT_DEP_OVERRIDES_FILE}")
+function(vnm_msdf_text_alias_msdfgen_targets)
+  if(TARGET msdfgen-core AND NOT TARGET msdfgen::msdfgen-core)
+    add_library(msdfgen::msdfgen-core ALIAS msdfgen-core)
+  endif()
+  if(TARGET msdfgen-ext AND NOT TARGET msdfgen::msdfgen-ext)
+    add_library(msdfgen::msdfgen-ext ALIAS msdfgen-ext)
+  endif()
+endfunction()
+
+if(DEFINED VNM_MSDF_TEXT_DEP_OVERRIDES_FILE AND
+   NOT VNM_MSDF_TEXT_DEP_OVERRIDES_FILE STREQUAL "")
+  if(EXISTS "${VNM_MSDF_TEXT_DEP_OVERRIDES_FILE}")
+    message(STATUS
+      "vnm_msdf_text: Loading dependency overrides from "
+      "${VNM_MSDF_TEXT_DEP_OVERRIDES_FILE}")
+    include("${VNM_MSDF_TEXT_DEP_OVERRIDES_FILE}")
+  else()
+    message(FATAL_ERROR
+      "vnm_msdf_text: VNM_MSDF_TEXT_DEP_OVERRIDES_FILE was set to "
+      "'${VNM_MSDF_TEXT_DEP_OVERRIDES_FILE}', but that file does not exist.")
+  endif()
 endif()
 
-if(VNM_MSDF_TEXT_USE_SYSTEM_LIBS)
-  find_package(Freetype QUIET)
-  if(FREETYPE_FOUND)
-    if(TARGET Freetype::Freetype)
-      # ok
-    elseif(TARGET freetype)
-      add_library(Freetype::Freetype ALIAS freetype)
-    else()
-      add_library(Freetype::Freetype INTERFACE IMPORTED)
-      set_target_properties(Freetype::Freetype PROPERTIES
-        INTERFACE_INCLUDE_DIRECTORIES "${FREETYPE_INCLUDE_DIRS}"
-        INTERFACE_LINK_LIBRARIES "${FREETYPE_LIBRARIES}")
-    endif()
+if(NOT TARGET Freetype::Freetype AND NOT TARGET freetype)
+  find_package(Freetype CONFIG QUIET)
+  if(NOT TARGET Freetype::Freetype AND NOT TARGET freetype AND
+     NOT Freetype_FOUND AND NOT FREETYPE_FOUND)
+    find_package(Freetype MODULE QUIET)
   endif()
+endif()
 
-  find_package(msdfgen QUIET)
+vnm_msdf_text_alias_freetype_target()
+
+if((Freetype_FOUND OR FREETYPE_FOUND) AND
+   NOT TARGET Freetype::Freetype AND
+   FREETYPE_INCLUDE_DIRS AND FREETYPE_LIBRARIES)
+  add_library(Freetype::Freetype INTERFACE IMPORTED)
+  set_target_properties(Freetype::Freetype PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${FREETYPE_INCLUDE_DIRS}"
+    INTERFACE_LINK_LIBRARIES "${FREETYPE_LIBRARIES}")
 endif()
 
 if(TARGET Freetype::Freetype)
-  message(STATUS "vnm_msdf_text: Using existing Freetype::Freetype target")
-elseif(TARGET freetype)
-  add_library(Freetype::Freetype ALIAS freetype)
-  message(STATUS "vnm_msdf_text: Using existing freetype target")
-else()
+  message(STATUS "vnm_msdf_text: Using Freetype::Freetype")
+elseif(VNM_MSDF_TEXT_FETCH_DEPS)
   if(FETCHCONTENT_SOURCE_DIR_FREETYPE AND
      EXISTS "${FETCHCONTENT_SOURCE_DIR_FREETYPE}/CMakeLists.txt")
-    message(STATUS "vnm_msdf_text: Using local freetype checkout: ${FETCHCONTENT_SOURCE_DIR_FREETYPE}")
+    message(STATUS
+      "vnm_msdf_text: Using local freetype checkout: "
+      "${FETCHCONTENT_SOURCE_DIR_FREETYPE}")
   else()
     message(STATUS "vnm_msdf_text: Fetching freetype")
   endif()
@@ -72,7 +114,7 @@ else()
   FetchContent_Declare(freetype
     GIT_REPOSITORY https://gitlab.freedesktop.org/freetype/freetype.git
     GIT_TAG VER-2-13-3
-    GIT_SHALLOW FALSE
+    GIT_SHALLOW TRUE
     BINARY_DIR "${FETCHCONTENT_BINARY_DIR_freetype}"
   )
 
@@ -84,17 +126,37 @@ else()
   set(FT_ENABLE_ERROR_STRINGS OFF CACHE BOOL "" FORCE)
 
   FetchContent_MakeAvailable(freetype)
-  if(TARGET freetype AND NOT TARGET Freetype::Freetype)
-    add_library(Freetype::Freetype ALIAS freetype)
+  vnm_msdf_text_alias_freetype_target()
+
+  if(NOT TARGET Freetype::Freetype)
+    message(FATAL_ERROR
+      "vnm_msdf_text: FreeType was fetched, but target "
+      "Freetype::Freetype was not created.")
   endif()
+else()
+  message(FATAL_ERROR
+    "vnm_msdf_text: FreeType dependency not found. Provide an existing "
+    "Freetype::Freetype target, install a find_package(Freetype)-compatible "
+    "package, or configure with -DVNM_MSDF_TEXT_FETCH_DEPS=ON. For offline "
+    "FetchContent builds, also set FETCHCONTENT_SOURCE_DIR_FREETYPE or "
+    "VNM_MSDF_TEXT_DEP_OVERRIDES_FILE.")
+endif()
+
+vnm_msdf_text_alias_msdfgen_targets()
+
+if(NOT TARGET msdfgen::msdfgen-core OR NOT TARGET msdfgen::msdfgen-ext)
+  find_package(msdfgen CONFIG QUIET)
+  vnm_msdf_text_alias_msdfgen_targets()
 endif()
 
 if(TARGET msdfgen::msdfgen-core AND TARGET msdfgen::msdfgen-ext)
-  message(STATUS "vnm_msdf_text: Using existing msdfgen targets")
-else()
+  message(STATUS "vnm_msdf_text: Using msdfgen targets")
+elseif(VNM_MSDF_TEXT_FETCH_DEPS)
   if(FETCHCONTENT_SOURCE_DIR_MSDFGEN AND
      EXISTS "${FETCHCONTENT_SOURCE_DIR_MSDFGEN}/CMakeLists.txt")
-    message(STATUS "vnm_msdf_text: Using local msdfgen checkout: ${FETCHCONTENT_SOURCE_DIR_MSDFGEN}")
+    message(STATUS
+      "vnm_msdf_text: Using local msdfgen checkout: "
+      "${FETCHCONTENT_SOURCE_DIR_MSDFGEN}")
   else()
     message(STATUS "vnm_msdf_text: Fetching msdfgen")
   endif()
@@ -102,7 +164,7 @@ else()
   FetchContent_Declare(msdfgen
     GIT_REPOSITORY https://github.com/Chlumsky/msdfgen.git
     GIT_TAG v1.12.1
-    GIT_SHALLOW FALSE
+    GIT_SHALLOW TRUE
     BINARY_DIR "${FETCHCONTENT_BINARY_DIR_msdfgen}"
   )
   set(MSDFGEN_USE_VCPKG OFF CACHE BOOL "" FORCE)
@@ -115,33 +177,21 @@ else()
     set(MSDFGEN_DYNAMIC_RUNTIME ON CACHE BOOL "" FORCE)
   endif()
   FetchContent_MakeAvailable(msdfgen)
-endif()
+  vnm_msdf_text_alias_msdfgen_targets()
 
-foreach(VNM_MSDF_TEXT_MSDFGEN_TARGET msdfgen-core msdfgen-ext)
-  if(TARGET ${VNM_MSDF_TEXT_MSDFGEN_TARGET})
-    get_target_property(
-      VNM_MSDF_TEXT_MSDFGEN_PUBLIC_HEADERS
-      ${VNM_MSDF_TEXT_MSDFGEN_TARGET}
-      PUBLIC_HEADER)
-    if(VNM_MSDF_TEXT_MSDFGEN_PUBLIC_HEADERS)
-      set(VNM_MSDF_TEXT_MSDFGEN_ABSOLUTE_PUBLIC_HEADERS)
-      foreach(VNM_MSDF_TEXT_MSDFGEN_PUBLIC_HEADER ${VNM_MSDF_TEXT_MSDFGEN_PUBLIC_HEADERS})
-        if(IS_ABSOLUTE "${VNM_MSDF_TEXT_MSDFGEN_PUBLIC_HEADER}")
-          list(APPEND
-            VNM_MSDF_TEXT_MSDFGEN_ABSOLUTE_PUBLIC_HEADERS
-            "${VNM_MSDF_TEXT_MSDFGEN_PUBLIC_HEADER}")
-        else()
-          list(APPEND
-            VNM_MSDF_TEXT_MSDFGEN_ABSOLUTE_PUBLIC_HEADERS
-            "${msdfgen_SOURCE_DIR}/${VNM_MSDF_TEXT_MSDFGEN_PUBLIC_HEADER}")
-        endif()
-      endforeach()
-      set_target_properties(${VNM_MSDF_TEXT_MSDFGEN_TARGET}
-        PROPERTIES
-          PUBLIC_HEADER "${VNM_MSDF_TEXT_MSDFGEN_ABSOLUTE_PUBLIC_HEADERS}")
-    endif()
+  if(NOT TARGET msdfgen::msdfgen-core OR NOT TARGET msdfgen::msdfgen-ext)
+    message(FATAL_ERROR
+      "vnm_msdf_text: msdfgen was fetched, but targets "
+      "msdfgen::msdfgen-core and msdfgen::msdfgen-ext were not created.")
   endif()
-endforeach()
+else()
+  message(FATAL_ERROR
+    "vnm_msdf_text: msdfgen dependency not found. Provide existing "
+    "msdfgen::msdfgen-core and msdfgen::msdfgen-ext targets, install a "
+    "find_package(msdfgen)-compatible package, or configure with "
+    "-DVNM_MSDF_TEXT_FETCH_DEPS=ON. For offline FetchContent builds, also "
+    "set FETCHCONTENT_SOURCE_DIR_MSDFGEN or VNM_MSDF_TEXT_DEP_OVERRIDES_FILE.")
+endif()
 
 add_library(vnm_msdf_text STATIC
   src/msdf_text.cpp
@@ -175,15 +225,35 @@ else()
   target_compile_options(vnm_msdf_text PRIVATE -Wall -Wextra)
 endif()
 
-if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+if(VNM_MSDF_TEXT_BUILD_TESTS)
+  enable_testing()
+
+  add_executable(vnm_msdf_text_tests
+    tests/msdf_text_tests.cpp
+  )
+  target_link_libraries(vnm_msdf_text_tests PRIVATE vnm_msdf_text)
+  target_compile_features(vnm_msdf_text_tests PRIVATE cxx_std_20)
+  target_compile_definitions(vnm_msdf_text_tests PRIVATE
+    VNM_MSDF_TEXT_TEST_FONT_FILE="${CMAKE_CURRENT_SOURCE_DIR}/fonts/monospace.ttf"
+  )
+
+  if(MSVC)
+    target_compile_options(vnm_msdf_text_tests PRIVATE /W4)
+  else()
+    target_compile_options(vnm_msdf_text_tests PRIVATE -Wall -Wextra)
+  endif()
+
+  add_test(NAME vnm_msdf_text_tests COMMAND vnm_msdf_text_tests)
+endif()
+
+if(VNM_MSDF_TEXT_IS_TOP_LEVEL)
   include(GNUInstallDirs)
   include(CMakePackageConfigHelpers)
 
   # install(EXPORT) requires every PUBLIC link dependency to be either
-  # IMPORTED or part of an installed export set. msdfgen/Freetype only
-  # satisfy that when VNM_MSDF_TEXT_USE_SYSTEM_LIBS=ON brought them in via
-  # find_package; in the FetchContent path they are locally-built targets,
-  # so we install headers and the library archive but skip the export.
+  # IMPORTED or part of an installed export set. Locally-built dependencies
+  # from FetchContent or a parent project do not satisfy that here, so we
+  # install headers and the library archive but skip the export.
   set(_vnm_msdf_text_export_ok TRUE)
   foreach(_dep IN ITEMS Freetype::Freetype msdfgen::msdfgen-core msdfgen::msdfgen-ext)
     if(TARGET ${_dep})
@@ -196,6 +266,9 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
   install(DIRECTORY include/vnm_msdf_text
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+  )
+  install(FILES LICENSE.txt THIRD_PARTY_NOTICES.md
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}
   )
 
   if(_vnm_msdf_text_export_ok)
@@ -237,8 +310,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     )
     message(STATUS
       "vnm_msdf_text: Skipping find_package export because Freetype/msdfgen are "
-      "built locally via FetchContent. Configure with "
-      "-DVNM_MSDF_TEXT_USE_SYSTEM_LIBS=ON (and have those packages "
-      "find_package-able) to install a find_package-ready vnm_msdf_text.")
+      "built locally. Configure with -DVNM_MSDF_TEXT_FETCH_DEPS=OFF and "
+      "provide find_package-able dependencies to install a find_package-ready "
+      "vnm_msdf_text package.")
   endif()
 endif()

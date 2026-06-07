@@ -5,18 +5,59 @@
 
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
 #include <limits>
+#include <memory>
+#include <new>
+#include <stdexcept>
+#include <unordered_map>
+#include <utility>
 
 namespace vnm {
 namespace msdf_text {
 namespace {
 
 constexpr char32_t k_replacement_char = 0xFFFD;
+constexpr msdfgen::FontCoordinateScaling k_font_scaling = msdfgen::FONT_SCALING_EM_NORMALIZED;
 
 bool is_continuation(unsigned char c)
 {
     return (c & 0xC0) == 0x80;
 }
+
+bool is_unicode_scalar_value(char32_t codepoint)
+{
+    return codepoint <= 0x10FFFF &&
+        (codepoint < 0xD800 || codepoint > 0xDFFF);
+}
+
+bool is_finite_positive(double value)
+{
+    return std::isfinite(value) && value > 0.0;
+}
+
+struct Freetype_deleter
+{
+    void operator()(msdfgen::FreetypeHandle* handle) const noexcept
+    {
+        if (handle) {
+            msdfgen::deinitializeFreetype(handle);
+        }
+    }
+};
+
+struct Font_deleter
+{
+    void operator()(msdfgen::FontHandle* handle) const noexcept
+    {
+        if (handle) {
+            msdfgen::destroyFont(handle);
+        }
+    }
+};
+
+using freetype_ptr = std::unique_ptr<msdfgen::FreetypeHandle, Freetype_deleter>;
+using font_ptr     = std::unique_ptr<msdfgen::FontHandle, Font_deleter>;
 
 char32_t utf8_decode_one(const char*& it, const char* end)
 {
@@ -54,7 +95,8 @@ char32_t utf8_decode_one(const char*& it, const char* end)
     }
 
     const auto* sequence_end = reinterpret_cast<const unsigned char*>(end);
-    if (p + sequence_length - 1 > sequence_end) {
+    const std::size_t continuation_count = sequence_length - 1;
+    if (static_cast<std::size_t>(sequence_end - p) < continuation_count) {
         it = end;
         return k_replacement_char;
     }
@@ -113,22 +155,112 @@ std::size_t codepoint_to_utf8(char32_t codepoint, char* out)
     return 0;
 }
 
-void append_utf8(std::vector<char32_t>& chars, std::string_view utf8)
+void append_range(std::vector<char32_t>& chars, char32_t first, char32_t last)
 {
-    const auto decoded = utf8_to_codepoints(utf8);
-    chars.insert(chars.end(), decoded.begin(), decoded.end());
+    for (char32_t codepoint = first; codepoint <= last; ++codepoint) {
+        chars.push_back(codepoint);
+    }
+}
+
+void append_codepoints(
+    std::vector<char32_t>& chars,
+    std::initializer_list<char32_t> codepoints)
+{
+    chars.insert(chars.end(), codepoints.begin(), codepoints.end());
 }
 
 build_result_t failure(const std::string& message)
 {
     build_result_t result;
-    result.ok = false;
+    result.status = Build_status::FAILURE;
     result.message = message;
     return result;
 }
 
+std::vector<char32_t> normalized_codepoints(
+    std::span<const char32_t> codepoints,
+    std::vector<char32_t>& invalid_codepoints)
+{
+    std::vector<char32_t> normalized;
+    normalized.reserve(codepoints.size());
+
+    for (char32_t codepoint : codepoints) {
+        if (is_unicode_scalar_value(codepoint)) {
+            normalized.push_back(codepoint);
+        }
+        else {
+            invalid_codepoints.push_back(codepoint);
+        }
+    }
+
+    std::sort(normalized.begin(), normalized.end());
+    normalized.erase(std::unique(normalized.begin(), normalized.end()), normalized.end());
+
+    std::sort(invalid_codepoints.begin(), invalid_codepoints.end());
+    invalid_codepoints.erase(
+        std::unique(invalid_codepoints.begin(), invalid_codepoints.end()),
+        invalid_codepoints.end());
+
+    return normalized;
+}
+
+bool has_partial_build_diagnostics(const build_result_t& result)
+{
+    return !result.invalid_codepoints.empty() ||
+        !result.missing_codepoints.empty() ||
+        !result.failed_codepoints.empty() ||
+        !result.skipped_too_large.empty() ||
+        !result.skipped_no_space.empty() ||
+        result.atlas_full;
+}
+
+void sort_unique_codepoints(std::vector<char32_t>& codepoints)
+{
+    std::sort(codepoints.begin(), codepoints.end());
+    codepoints.erase(std::unique(codepoints.begin(), codepoints.end()), codepoints.end());
+}
+
+void normalize_build_diagnostics(build_result_t& result)
+{
+    sort_unique_codepoints(result.invalid_codepoints);
+    sort_unique_codepoints(result.missing_codepoints);
+    sort_unique_codepoints(result.failed_codepoints);
+    sort_unique_codepoints(result.skipped_too_large);
+    sort_unique_codepoints(result.skipped_no_space);
+}
+
+void append_codepoints(
+    std::vector<char32_t>& destination,
+    const std::vector<char32_t>& source)
+{
+    destination.insert(destination.end(), source.begin(), source.end());
+}
+
+struct Glyph_group
+{
+    msdfgen::GlyphIndex glyph_index;
+    std::vector<char32_t> codepoints;
+};
+
+struct Glyph_job
+{
+    msdfgen::GlyphIndex glyph_index;
+    std::vector<char32_t> codepoints;
+    msdfgen::Shape shape;
+    msdfgen::Shape::Bounds bounds{};
+    double advance = 0.0;
+    int bitmap_w = 0;
+    int bitmap_h = 0;
+};
+
+struct Emitted_glyph
+{
+    char32_t codepoint = 0;
+    msdfgen::GlyphIndex glyph_index;
+};
+
 template <class Visitor>
-float for_each_positioned_glyph(
+float for_each_positioned_glyph_impl(
     const atlas_t& atlas,
     std::string_view text,
     float start_x,
@@ -136,19 +268,22 @@ float for_each_positioned_glyph(
 {
     float pen_x = start_x;
     char32_t previous = 0;
-    const auto codepoints = utf8_to_codepoints(text);
-    for (char32_t codepoint : codepoints) {
+    const char* it = text.data();
+    const char* end = it + text.size();
+    while (it < end) {
+        const char32_t codepoint = utf8_decode_one(it, end);
         const auto glyph_it = atlas.glyphs.find(codepoint);
         if (glyph_it == atlas.glyphs.end()) {
             continue;
         }
         if (previous != 0) {
-            const auto kerning_it = atlas.kerning_px.find(kerning_key_t{previous, codepoint});
+            const auto kerning_it =
+                atlas.kerning_px.find(make_kerning_key(previous, codepoint));
             if (kerning_it != atlas.kerning_px.end()) {
                 pen_x += kerning_it->second;
             }
         }
-        visit(pen_x, glyph_it->second);
+        visit(codepoint, pen_x, glyph_it->second);
         pen_x += glyph_it->second.advance_x;
         previous = codepoint;
     }
@@ -160,56 +295,41 @@ float for_each_positioned_glyph(
 std::vector<char32_t> default_codepoints()
 {
     static const std::vector<char32_t> codepoints = [] {
-        static const char* ascii_printable =
-            " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
-
-        static const char* latin_accented =
-            "\xC3\x80\xC3\x81\xC3\x82\xC3\x83\xC3\x84\xC3\x85\xC3\x86\xC3\x87\xC3\x88\xC3\x89\xC3\x8A"
-            "\xC3\x8B\xC3\x8C\xC3\x8D\xC3\x8E\xC3\x8F\xC3\x90\xC3\x91\xC3\x92\xC3\x93\xC3\x94\xC3\x95"
-            "\xC3\x96\xC3\x98\xC3\x99\xC3\x9A\xC3\x9B\xC3\x9C\xC3\x9D\xC3\x9E\xC3\x9F\xC3\xA0\xC3\xA1"
-            "\xC3\xA2\xC3\xA3\xC3\xA4\xC3\xA5\xC3\xA6\xC3\xA7\xC3\xA8\xC3\xA9\xC3\xAA\xC3\xAB\xC3\xAC"
-            "\xC3\xAD\xC3\xAE\xC3\xAF\xC3\xB0\xC3\xB1\xC3\xB2\xC3\xB3\xC3\xB4\xC3\xB5\xC3\xB6\xC3\xB8"
-            "\xC3\xB9\xC3\xBA\xC3\xBB\xC3\xBC\xC3\xBD\xC3\xBE\xC3\xBF\xC5\x92\xC5\x93\xC5\xA0\xC5\xA1"
-            "\xC5\xB8\xC6\x92";
-
-        static const char* greek =
-            "\xCE\x91\xCE\x92\xCE\x93\xCE\x94\xCE\x95\xCE\x96\xCE\x97\xCE\x98\xCE\x99\xCE\x9A\xCE\x9B"
-            "\xCE\x9C\xCE\x9D\xCE\x9E\xCE\x9F\xCE\xA0\xCE\xA1\xCE\xA3\xCE\xA4\xCE\xA5\xCE\xA6\xCE\xA7"
-            "\xCE\xA8\xCE\xA9\xCE\xB1\xCE\xB2\xCE\xB3\xCE\xB4\xCE\xB5\xCE\xB6\xCE\xB7\xCE\xB8\xCE\xB9"
-            "\xCE\xBA\xCE\xBB\xCE\xBC\xCE\xBD\xCE\xBE\xCE\xBF\xCF\x80\xCF\x81\xCF\x83\xCF\x84\xCF\x85"
-            "\xCF\x86\xCF\x87\xCF\x88\xCF\x89\xCE\x86\xCE\x88\xCE\x89\xCE\x8A\xCE\x8C\xCE\x8E\xCE\x8F"
-            "\xCE\xAC\xCE\xAD\xCE\xAE\xCE\xAF\xCF\x8C\xCF\x8D\xCF\x8E\xCF\x8A\xCF\x8B\xCE\x90\xCE\xB0"
-            "\xCE\xAA\xCE\xAB\xCF\x82\xC2\xAB\xC2\xBB\xCE\x87";
-
-        static const char* currency_popular =
-            "\xE2\x82\xAC\xC2\xA2\xC2\xA3\xC2\xA4\xC2\xA5\xE0\xB8\xBF\xE2\x82\xBD\xE2\x82\xB9\xE2"
-            "\x82\xA9";
-
-        static const char* currency_all =
-            "\xE2\x82\xB5\xD8\x8B\xE0\xA7\xB2\xE0\xA7\xB3\xE0\xA7\xBB\xE0\xAB\xB1\xE0\xAF\xB9\xE1\x9F"
-            "\x9B\xE2\x82\xA0\xE2\x82\xA1\xE2\x82\xA2\xE2\x82\xA3\xE2\x82\xA4\xE2\x82\xA5\xE2\x82\xA6"
-            "\xE2\x82\xA7\xE2\x82\xA8\xE2\x82\xAA\xE2\x82\xAB\xE2\x82\xAD\xE2\x82\xAE\xE2\x82\xAF\xE2"
-            "\x82\xB0\xE2\x82\xB1\xE2\x82\xB2\xE2\x82\xB3\xE2\x82\xB4\xE2\x82\xB8\xE2\x82\xBA\xE2\x82"
-            "\xBC\xE2\x82\xBE\xEF\xB7\xBC\xEF\xB9\xA9\xEF\xBC\x84\xEF\xBF\xA0\xEF\xBF\xA1\xEF\xBF\xA5"
-            "\xEF\xBF\xA6";
-
-        static const char* ui_symbols =
-            "\xE2\x98\x90"
-            "\xE2\x98\x91"
-            "\xE2\x98\x92"
-            "\xF0\x9F\x94\x98"
-            "\xF0\x9F\x97\x95"
-            "\xF0\x9F\x97\x96"
-            "\xF0\x9F\x97\x97"
-            "\xE2\x9C\x95";
-
         std::vector<char32_t> chars;
-        append_utf8(chars, ascii_printable);
-        append_utf8(chars, latin_accented);
-        append_utf8(chars, greek);
-        append_utf8(chars, currency_popular);
-        append_utf8(chars, currency_all);
-        append_utf8(chars, ui_symbols);
+        append_range(chars, U' ', U'~');
+
+        append_range(chars, 0x00C0, 0x00D6);
+        append_range(chars, 0x00D8, 0x00F6);
+        append_range(chars, 0x00F8, 0x00FF);
+        append_codepoints(chars, {
+            0x0152, 0x0153, 0x0160, 0x0161, 0x0178, 0x0192,
+        });
+
+        append_range(chars, 0x0391, 0x03A1);
+        append_range(chars, 0x03A3, 0x03A9);
+        append_range(chars, 0x03B1, 0x03C1);
+        append_range(chars, 0x03C3, 0x03C9);
+        append_codepoints(chars, {
+            0x0386, 0x0388, 0x0389, 0x038A, 0x038C, 0x038E, 0x038F,
+            0x0390, 0x03AA, 0x03AB, 0x03AC, 0x03AD, 0x03AE, 0x03AF,
+            0x03B0, 0x03C2, 0x03CA, 0x03CB, 0x03CC, 0x03CD, 0x03CE,
+        });
+
+        append_codepoints(chars, {
+            0x00A2, 0x00A3, 0x00A4, 0x00A5, 0x00AB, 0x00BB,
+            0x060B, 0x09F2, 0x09F3, 0x09FB, 0x0AF1, 0x0BF9, 0x0E3F,
+            0x17DB, 0x20A0, 0x20A1, 0x20A2, 0x20A3, 0x20A4, 0x20A5,
+            0x20A6, 0x20A7, 0x20A8, 0x20A9, 0x20AA, 0x20AB, 0x20AC,
+            0x20AD, 0x20AE, 0x20AF, 0x20B0, 0x20B1, 0x20B2, 0x20B3,
+            0x20B4, 0x20B5, 0x20B8, 0x20B9, 0x20BA, 0x20BC, 0x20BD,
+            0x20BE, 0xFDFC, 0xFE69, 0xFF04, 0xFFE0, 0xFFE1, 0xFFE5,
+            0xFFE6,
+        });
+
+        append_codepoints(chars, {
+            0x2610, 0x2611, 0x2612, 0x2715, 0xFFFD,
+            0x0387, 0x1F518, 0x1F5D5, 0x1F5D6, 0x1F5D7,
+        });
         std::sort(chars.begin(), chars.end());
         chars.erase(std::unique(chars.begin(), chars.end()), chars.end());
         return chars;
@@ -232,7 +352,7 @@ std::vector<char32_t> utf8_to_codepoints(std::string_view text)
     return result;
 }
 
-std::string codepoints_to_utf8(const std::vector<char32_t>& codepoints)
+std::string codepoints_to_utf8(std::span<const char32_t> codepoints)
 {
     std::string result;
     result.reserve(codepoints.size() * 2);
@@ -258,188 +378,460 @@ build_result_t build_font_atlas(
     if (!font_data || font_size == 0) {
         return failure("No font data supplied");
     }
+    if (font_size > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return failure("Font data is too large for msdfgen");
+    }
     if (pixel_height <= 0) {
         return failure("Font pixel height must be positive");
     }
     if (options.atlas_size <= 0) {
         return failure("MSDF atlas size must be positive");
     }
+    if (!is_finite_positive(options.min_atlas_font_size)) {
+        return failure("Minimum atlas font size must be finite and positive");
+    }
+    if (!is_finite_positive(options.atlas_px_range)) {
+        return failure("MSDF atlas pixel range must be finite and positive");
+    }
+    if (!is_finite_positive(options.sharpness_bias)) {
+        return failure("MSDF sharpness bias must be finite and positive");
+    }
+    if (options.atlas_gutter_px < 0 ||
+        options.atlas_gutter_px > options.atlas_size)
+    {
+        return failure("MSDF atlas gutter must be between zero and atlas size");
+    }
 
-    msdfgen::FreetypeHandle* ft = msdfgen::initializeFreetype();
+    std::vector<char32_t> invalid_codepoints;
+    const std::vector<char32_t> requested_codepoints =
+        normalized_codepoints(codepoints, invalid_codepoints);
+    if (requested_codepoints.empty()) {
+        build_result_t result = failure("No valid codepoints supplied");
+        result.invalid_codepoints = std::move(invalid_codepoints);
+        return result;
+    }
+
+    const std::size_t atlas_size = static_cast<std::size_t>(options.atlas_size);
+    if (atlas_size > std::numeric_limits<std::size_t>::max() / atlas_size) {
+        return failure("MSDF atlas pixel count overflows size_t");
+    }
+    const std::size_t atlas_pixel_count = atlas_size * atlas_size;
+    if (atlas_pixel_count > std::numeric_limits<std::size_t>::max() / 4u) {
+        return failure("MSDF atlas byte size overflows size_t");
+    }
+    const std::size_t atlas_byte_count = atlas_pixel_count * 4u;
+
+    freetype_ptr ft(msdfgen::initializeFreetype());
     if (!ft) {
         return failure("Failed to initialize FreeType for msdfgen");
     }
 
-    msdfgen::FontHandle* font_handle = msdfgen::loadFontData(
-        ft,
+    font_ptr font_handle(msdfgen::loadFontData(
+        ft.get(),
         reinterpret_cast<const msdfgen::byte*>(font_data),
-        static_cast<int>(font_size));
+        static_cast<int>(font_size)));
     if (!font_handle) {
-        msdfgen::deinitializeFreetype(ft);
         return failure("Failed to load font data for msdfgen");
     }
 
     msdfgen::FontMetrics metrics{};
-    if (!msdfgen::getFontMetrics(metrics, font_handle)) {
-        msdfgen::destroyFont(font_handle);
-        msdfgen::deinitializeFreetype(ft);
+    if (!msdfgen::getFontMetrics(metrics, font_handle.get(), k_font_scaling)) {
         return failure("Failed to query font metrics for msdfgen");
+    }
+    if (!is_finite_positive(metrics.ascenderY) ||
+        !std::isfinite(metrics.descenderY) ||
+        !std::isfinite(metrics.lineHeight) ||
+        !std::isfinite(metrics.emSize))
+    {
+        return failure("Font metrics are not finite and usable");
     }
 
     build_result_t result;
-    result.ok = true;
-    atlas_t& atlas = result.atlas;
-    atlas.pixel_height = pixel_height;
-    atlas.atlas_size = options.atlas_size;
+    result.invalid_codepoints = std::move(invalid_codepoints);
+    const auto fail_with_diagnostics = [&](const std::string& message) {
+        result.status = Build_status::FAILURE;
+        result.message = message;
+        result.atlas = atlas_t{};
+        return result;
+    };
 
+    const double atlas_px_range = options.atlas_px_range;
     const double bitmap_scale =
         std::max(static_cast<double>(pixel_height), options.min_atlas_font_size) /
         metrics.ascenderY;
     const double draw_scale = static_cast<double>(pixel_height) / metrics.ascenderY;
     const double screen_to_atlas_ratio = draw_scale / bitmap_scale;
+    if (!is_finite_positive(bitmap_scale) ||
+        !is_finite_positive(draw_scale) ||
+        !is_finite_positive(screen_to_atlas_ratio))
+    {
+        return failure("Font scaling values are not finite and usable");
+    }
 
-    atlas.px_range =
-        (options.atlas_px_range * static_cast<float>(screen_to_atlas_ratio)) *
+    const float output_px_range =
+        (static_cast<float>(atlas_px_range) * static_cast<float>(screen_to_atlas_ratio)) *
         options.sharpness_bias;
-    atlas.baseline_offset_px = static_cast<float>(-metrics.descenderY * draw_scale);
-    atlas.rgba.assign(
-        static_cast<std::size_t>(options.atlas_size) *
-        static_cast<std::size_t>(options.atlas_size) * 4,
-        0);
+    if (!is_finite_positive(output_px_range)) {
+        return failure("MSDF output pixel range is not finite and usable");
+    }
+
+    font_metrics_px_t output_font_metrics;
+    output_font_metrics.ascender = static_cast<float>(metrics.ascenderY * draw_scale);
+    output_font_metrics.descender = static_cast<float>(metrics.descenderY * draw_scale);
+    output_font_metrics.line_height = static_cast<float>(metrics.lineHeight * draw_scale);
+    output_font_metrics.em_size = static_cast<float>(metrics.emSize * draw_scale);
+
+    std::vector<Glyph_group> glyph_groups;
+    glyph_groups.reserve(requested_codepoints.size());
+    std::unordered_map<unsigned, std::size_t> glyph_group_by_index;
+    glyph_group_by_index.reserve(requested_codepoints.size());
+
+    const auto add_codepoint_to_group =
+        [&](char32_t codepoint, msdfgen::GlyphIndex glyph_index) {
+            const unsigned glyph_index_value = glyph_index.getIndex();
+            const auto [it, inserted] =
+                glyph_group_by_index.emplace(glyph_index_value, glyph_groups.size());
+            if (inserted) {
+                Glyph_group group;
+                group.glyph_index = glyph_index;
+                glyph_groups.push_back(std::move(group));
+            }
+            glyph_groups[it->second].codepoints.push_back(codepoint);
+        };
+
+    msdfgen::GlyphIndex replacement_glyph_index;
+    const bool replacement_glyph_available =
+        msdfgen::getGlyphIndex(
+            replacement_glyph_index,
+            font_handle.get(),
+            static_cast<msdfgen::unicode_t>(k_replacement_char));
+
+    for (char32_t codepoint : requested_codepoints) {
+        const auto unicode = static_cast<msdfgen::unicode_t>(codepoint);
+
+        msdfgen::GlyphIndex glyph_index;
+        if (!msdfgen::getGlyphIndex(glyph_index, font_handle.get(), unicode)) {
+            result.missing_codepoints.push_back(codepoint);
+            if (options.missing_glyph_policy == Missing_glyph_policy::USE_REPLACEMENT_CHARACTER &&
+                replacement_glyph_available)
+            {
+                add_codepoint_to_group(codepoint, replacement_glyph_index);
+            }
+            continue;
+        }
+
+        add_codepoint_to_group(codepoint, glyph_index);
+    }
+
+    if (options.missing_glyph_policy == Missing_glyph_policy::FAIL_BUILD &&
+        !result.missing_codepoints.empty())
+    {
+        normalize_build_diagnostics(result);
+        return fail_with_diagnostics("Font is missing required glyphs");
+    }
+
+    atlas_t& atlas = result.atlas;
+    atlas.pixel_height = pixel_height;
+    atlas.atlas_size = options.atlas_size;
+    atlas.px_range = output_px_range;
+    atlas.font_metrics = output_font_metrics;
+
+    if (atlas_byte_count > atlas.rgba.max_size()) {
+        return fail_with_diagnostics("MSDF atlas storage exceeds vector capacity");
+    }
+    try {
+        atlas.rgba.assign(atlas_byte_count, 0);
+    }
+    catch (const std::bad_alloc&) {
+        return fail_with_diagnostics("Failed to allocate MSDF atlas storage");
+    }
 
     int pen_x = 0;
     int pen_y = 0;
     int row_h = 0;
+    const int atlas_gutter_px = options.atlas_gutter_px;
+    std::vector<Emitted_glyph> emitted_glyphs;
+    emitted_glyphs.reserve(requested_codepoints.size());
+    std::vector<Glyph_job> visible_jobs;
+    visible_jobs.reserve(glyph_groups.size());
 
-    for (char32_t codepoint : codepoints) {
+    for (const Glyph_group& group : glyph_groups) {
         msdfgen::Shape shape;
         double advance = 0.0;
         if (!msdfgen::loadGlyph(
                 shape,
-                font_handle,
-                static_cast<msdfgen::unicode_t>(codepoint),
+                font_handle.get(),
+                group.glyph_index,
+                k_font_scaling,
                 &advance))
         {
+            append_codepoints(result.failed_codepoints, group.codepoints);
             continue;
         }
-        msdfgen::edgeColoringSimple(shape, 3.0, 0);
+        if (!std::isfinite(advance)) {
+            append_codepoints(result.failed_codepoints, group.codepoints);
+            continue;
+        }
+
+        if (shape.edgeCount() > 0) {
+            shape.normalize();
+            msdfgen::edgeColoringSimple(shape, 3.0, 0);
+        }
 
         const auto bounds = shape.getBounds();
         const double width_em = bounds.r - bounds.l;
         const double height_em = bounds.t - bounds.b;
+        if (!std::isfinite(width_em) || !std::isfinite(height_em)) {
+            append_codepoints(result.failed_codepoints, group.codepoints);
+            continue;
+        }
 
         if (height_em <= 0.0 || width_em <= 0.0) {
             if (advance > 0.0) {
                 glyph_t glyph;
                 glyph.advance_x = static_cast<float>(advance * draw_scale);
-                atlas.glyphs.emplace(codepoint, glyph);
+                for (char32_t codepoint : group.codepoints) {
+                    atlas.glyphs.emplace(codepoint, glyph);
+                    emitted_glyphs.push_back(Emitted_glyph{codepoint, group.glyph_index});
+                    if (codepoint == static_cast<char32_t>('0')) {
+                        atlas.zero_advance_px = glyph.advance_x;
+                        atlas.zero_advance_available = glyph.advance_x > 0.0f;
+                    }
+                }
             }
             continue;
         }
 
-        const int bitmap_w = static_cast<int>(
-            std::ceil(width_em * bitmap_scale + options.atlas_px_range * 2.0f));
-        const int bitmap_h = static_cast<int>(
-            std::ceil(height_em * bitmap_scale + options.atlas_px_range * 2.0f));
+        const double bitmap_width_px  = width_em  * bitmap_scale + atlas_px_range * 2.0;
+        const double bitmap_height_px = height_em * bitmap_scale + atlas_px_range * 2.0;
+        if (!std::isfinite(bitmap_width_px) ||
+            !std::isfinite(bitmap_height_px) ||
+            bitmap_width_px > static_cast<double>(std::numeric_limits<int>::max()) ||
+            bitmap_height_px > static_cast<double>(std::numeric_limits<int>::max()))
+        {
+            append_codepoints(result.skipped_too_large, group.codepoints);
+            continue;
+        }
+
+        const int bitmap_w = static_cast<int>(std::ceil(bitmap_width_px));
+        const int bitmap_h = static_cast<int>(std::ceil(bitmap_height_px));
         if (bitmap_w <= 0 ||
             bitmap_h <= 0 ||
             bitmap_w > options.atlas_size ||
             bitmap_h > options.atlas_size)
         {
+            append_codepoints(result.skipped_too_large, group.codepoints);
             continue;
         }
 
-        if (pen_x + bitmap_w > options.atlas_size) {
+        Glyph_job job;
+        job.glyph_index = group.glyph_index;
+        job.codepoints = group.codepoints;
+        job.shape = std::move(shape);
+        job.bounds = bounds;
+        job.advance = advance;
+        job.bitmap_w = bitmap_w;
+        job.bitmap_h = bitmap_h;
+        visible_jobs.push_back(std::move(job));
+    }
+
+    std::sort(
+        visible_jobs.begin(),
+        visible_jobs.end(),
+        [](const Glyph_job& left, const Glyph_job& right) {
+            if (left.bitmap_h != right.bitmap_h) {
+                return left.bitmap_h > right.bitmap_h;
+            }
+            if (left.bitmap_w != right.bitmap_w) {
+                return left.bitmap_w > right.bitmap_w;
+            }
+            const char32_t left_codepoint =
+                left.codepoints.empty() ? 0 : left.codepoints.front();
+            const char32_t right_codepoint =
+                right.codepoints.empty() ? 0 : right.codepoints.front();
+            return left_codepoint < right_codepoint;
+        });
+
+    for (std::size_t i = 0; i < visible_jobs.size(); ++i) {
+        const Glyph_job& job = visible_jobs[i];
+        const double width_em = job.bounds.r - job.bounds.l;
+        const double height_em = job.bounds.t - job.bounds.b;
+
+        if (pen_x > options.atlas_size - job.bitmap_w) {
             pen_x = 0;
-            pen_y += row_h + 1;
+            pen_y += row_h + atlas_gutter_px;
             row_h = 0;
         }
-        if (pen_y + bitmap_h > options.atlas_size) {
+        if (pen_y > options.atlas_size - job.bitmap_h) {
+            result.atlas_full = true;
+            for (std::size_t j = i; j < visible_jobs.size(); ++j) {
+                append_codepoints(result.skipped_no_space, visible_jobs[j].codepoints);
+            }
             if (log_debug) {
                 log_debug("MSDF atlas out of space, skipping remaining glyphs");
             }
             break;
         }
 
-        msdfgen::Bitmap<float, 4> bitmap(bitmap_w, bitmap_h);
+        msdfgen::Bitmap<float, 4> bitmap(job.bitmap_w, job.bitmap_h);
         const msdfgen::Vector2 msdf_scale(bitmap_scale, bitmap_scale);
         const msdfgen::Vector2 msdf_translate(
-            -bounds.l + (options.atlas_px_range / bitmap_scale),
-            -bounds.b + (options.atlas_px_range / bitmap_scale));
+            -job.bounds.l + (atlas_px_range / bitmap_scale),
+            -job.bounds.b + (atlas_px_range / bitmap_scale));
         const msdfgen::Projection projection(msdf_scale, msdf_translate);
-        msdfgen::generateMTSDF(bitmap, shape, projection, options.atlas_px_range);
+        const msdfgen::Range shape_range(atlas_px_range / bitmap_scale);
+        const msdfgen::SDFTransformation transform(
+            projection,
+            msdfgen::DistanceMapping(shape_range));
+        msdfgen::generateMTSDF(bitmap, job.shape, transform);
 
-        for (int y = 0; y < bitmap_h; ++y) {
-            for (int x = 0; x < bitmap_w; ++x) {
+        for (int y = 0; y < job.bitmap_h; ++y) {
+            for (int x = 0; x < job.bitmap_w; ++x) {
                 const auto& pixel = bitmap(x, y);
-                const int dst_idx = ((pen_y + y) * options.atlas_size + (pen_x + x)) * 4;
+                const std::size_t dst_idx =
+                    (static_cast<std::size_t>(pen_y + y) * atlas_size +
+                     static_cast<std::size_t>(pen_x + x)) * 4u;
                 for (int c = 0; c < 4; ++c) {
                     const float normalized = std::max(0.0f, std::min(pixel[c], 1.0f));
-                    atlas.rgba[static_cast<std::size_t>(dst_idx + c)] =
+                    atlas.rgba[dst_idx + static_cast<std::size_t>(c)] =
                         static_cast<std::uint8_t>(std::round(normalized * 255.0f));
                 }
             }
         }
 
         glyph_t glyph;
-        glyph.advance_x = static_cast<float>(advance * draw_scale);
+        glyph.advance_x = static_cast<float>(job.advance * draw_scale);
         glyph.plane_left =
-            static_cast<float>( bounds.l * draw_scale - options.atlas_px_range * screen_to_atlas_ratio);
+            static_cast<float>(
+                job.bounds.l * draw_scale - atlas_px_range * screen_to_atlas_ratio);
         glyph.plane_right =
-            static_cast<float>( bounds.r * draw_scale + options.atlas_px_range * screen_to_atlas_ratio);
+            static_cast<float>(
+                job.bounds.r * draw_scale + atlas_px_range * screen_to_atlas_ratio);
         glyph.plane_top =
-            static_cast<float>(-bounds.b * draw_scale + options.atlas_px_range * screen_to_atlas_ratio);
+            static_cast<float>(
+                -job.bounds.b * draw_scale + atlas_px_range * screen_to_atlas_ratio);
         glyph.plane_bottom =
-            static_cast<float>(-bounds.t * draw_scale - options.atlas_px_range * screen_to_atlas_ratio);
+            static_cast<float>(
+                -job.bounds.t * draw_scale - atlas_px_range * screen_to_atlas_ratio);
 
-        const double uv_width = width_em * bitmap_scale + 2.0 * options.atlas_px_range;
-        const double uv_height = height_em * bitmap_scale + 2.0 * options.atlas_px_range;
+        const double uv_width = width_em * bitmap_scale + 2.0 * atlas_px_range;
+        const double uv_height = height_em * bitmap_scale + 2.0 * atlas_px_range;
 
         glyph.uv_left   = static_cast<float>(pen_x)            / options.atlas_size;
         glyph.uv_right  = static_cast<float>(pen_x + uv_width) / options.atlas_size;
         glyph.uv_top    = static_cast<float>(pen_y)             / options.atlas_size;
         glyph.uv_bottom = static_cast<float>(pen_y + uv_height) / options.atlas_size;
 
-        atlas.glyphs.emplace(codepoint, glyph);
-
-        if (codepoint == static_cast<char32_t>('0')) {
-            atlas.monospace_advance_px = glyph.advance_x;
-            atlas.monospace_advance_reliable = glyph.advance_x > 0.0f;
+        for (char32_t codepoint : job.codepoints) {
+            atlas.glyphs.emplace(codepoint, glyph);
+            emitted_glyphs.push_back(Emitted_glyph{codepoint, job.glyph_index});
+            if (codepoint == static_cast<char32_t>('0')) {
+                atlas.zero_advance_px = glyph.advance_x;
+                atlas.zero_advance_available = glyph.advance_x > 0.0f;
+            }
         }
 
-        row_h = std::max(row_h, bitmap_h);
-        pen_x += bitmap_w + 1;
+        row_h = std::max(row_h, job.bitmap_h);
+        pen_x += job.bitmap_w + atlas_gutter_px;
     }
 
     if (options.build_kerning_table) {
-        for (char32_t left : codepoints) {
-            for (char32_t right : codepoints) {
+        for (const Emitted_glyph& left : emitted_glyphs) {
+            for (const Emitted_glyph& right : emitted_glyphs) {
                 double k = 0.0;
                 if (msdfgen::getKerning(
                         k,
-                        font_handle,
-                        static_cast<msdfgen::unicode_t>(left),
-                        static_cast<msdfgen::unicode_t>(right)))
+                        font_handle.get(),
+                        left.glyph_index,
+                        right.glyph_index,
+                        k_font_scaling))
                 {
                     const float kern_px = static_cast<float>(k * draw_scale);
                     if (kern_px != 0.0f) {
-                        atlas.kerning_px.emplace(kerning_key_t{left, right}, kern_px);
+                        atlas.kerning_px.emplace(
+                            make_kerning_key(left.codepoint, right.codepoint),
+                            kern_px);
                     }
                 }
             }
         }
     }
 
-    msdfgen::destroyFont(font_handle);
-    msdfgen::deinitializeFreetype(ft);
+    normalize_build_diagnostics(result);
+    if (atlas.glyphs.empty()) {
+        return fail_with_diagnostics("No requested glyphs could be added to the MSDF atlas");
+    }
+    else
+    if (has_partial_build_diagnostics(result)) {
+        result.status = Build_status::PARTIAL_SUCCESS;
+        result.message = "MSDF atlas built with skipped codepoints";
+    }
+    else {
+        result.status = Build_status::SUCCESS;
+        result.message = "MSDF atlas built";
+    }
+
     return result;
 }
 
-float measure_text_px(const atlas_t& atlas, std::string_view text)
+float measure_text_advance_px(const atlas_t& atlas, std::string_view text)
 {
-    return for_each_positioned_glyph(
+    return for_each_positioned_glyph_impl(
         atlas, text, 0.0f,
-        [](float, const glyph_t&) {});
+        [](char32_t, float, const glyph_t&) {});
+}
+
+float for_each_positioned_glyph(
+    const atlas_t& atlas,
+    std::string_view text,
+    float start_x,
+    const layout_callback_t& callback)
+{
+    return for_each_positioned_glyph_impl(
+        atlas,
+        text,
+        start_x,
+        [&](char32_t codepoint, float pen_x, const glyph_t& glyph) {
+            if (callback) {
+                callback(positioned_glyph_t{codepoint, &glyph, pen_x});
+            }
+        });
+}
+
+text_bounds_t measure_text_bounds_px(const atlas_t& atlas, std::string_view text)
+{
+    text_bounds_t bounds;
+    bounds.advance_x = for_each_positioned_glyph_impl(
+        atlas,
+        text,
+        0.0f,
+        [&](char32_t, float pen_x, const glyph_t& glyph) {
+            if (glyph.plane_left == glyph.plane_right ||
+                glyph.plane_bottom == glyph.plane_top)
+            {
+                return;
+            }
+
+            const float left = pen_x + glyph.plane_left;
+            const float right = pen_x + glyph.plane_right;
+            const float top = std::min(glyph.plane_bottom, glyph.plane_top);
+            const float bottom = std::max(glyph.plane_bottom, glyph.plane_top);
+
+            if (!bounds.has_visible_glyphs) {
+                bounds.left = left;
+                bounds.right = right;
+                bounds.top = top;
+                bounds.bottom = bottom;
+                bounds.has_visible_glyphs = true;
+                return;
+            }
+
+            bounds.left = std::min(bounds.left, left);
+            bounds.right = std::max(bounds.right, right);
+            bounds.top = std::min(bounds.top, top);
+            bounds.bottom = std::max(bounds.bottom, bottom);
+        });
+    return bounds;
 }
 
 void append_text_quads(
@@ -450,9 +842,24 @@ void append_text_quads(
     std::vector<text_vertex_t>& vertices,
     std::vector<std::uint32_t>* indices)
 {
-    for_each_positioned_glyph(
+    if (text.size() <= (vertices.max_size() - vertices.size()) / 4u) {
+        vertices.reserve(vertices.size() + text.size() * 4u);
+    }
+    if (indices &&
+        text.size() <= (indices->max_size() - indices->size()) / 6u)
+    {
+        indices->reserve(indices->size() + text.size() * 6u);
+    }
+
+    for_each_positioned_glyph_impl(
         atlas, text, x,
-        [&](float pen_x, const glyph_t& glyph) {
+        [&](char32_t, float pen_x, const glyph_t& glyph) {
+            if (glyph.plane_left == glyph.plane_right ||
+                glyph.plane_bottom == glyph.plane_top)
+            {
+                return;
+            }
+
             const float x0 = pen_x + glyph.plane_left;
             const float x1 = pen_x + glyph.plane_right;
             const float y0 = y + glyph.plane_bottom;
@@ -462,8 +869,16 @@ void append_text_quads(
             const float t_min = std::min(glyph.uv_top, glyph.uv_bottom);
             const float t_max = std::max(glyph.uv_top, glyph.uv_bottom);
 
-            const std::uint32_t base =
-                static_cast<std::uint32_t>(vertices.size());
+            std::uint32_t base = 0;
+            if (indices) {
+                if (vertices.size() >
+                    static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) - 4u)
+                {
+                    throw std::length_error("MSDF text index buffer exceeds uint32_t capacity");
+                }
+                base = static_cast<std::uint32_t>(vertices.size());
+            }
+
             vertices.push_back({x0, y0, glyph.uv_left,  glyph.uv_bottom, s_min, t_min, s_max, t_max});
             vertices.push_back({x0, y1, glyph.uv_left,  glyph.uv_top,    s_min, t_min, s_max, t_max});
             vertices.push_back({x1, y1, glyph.uv_right, glyph.uv_top,    s_min, t_min, s_max, t_max});
