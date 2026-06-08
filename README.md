@@ -25,6 +25,32 @@ The source code is licensed under the BSD 2-Clause License. The bundled
 and a requested set of Unicode scalar values. Requested codepoints are validated,
 sorted, and deduplicated before glyph generation.
 
+### Scale-independent atlas
+
+The baked bitmap is generated at `msdf_bake_pixel_height(draw_pixel_height,
+options)`, which is the requested `draw_pixel_height` clamped up to
+`ceil(options_t::min_atlas_font_size)`. Glyph geometry, kerning, and font metrics
+are stored in scale-independent font units (`glyph_t::bounds_*_units`,
+`glyph_t::advance_units`, `kerning_units`, `font_metrics_units`), not in output
+pixels. A single baked atlas therefore serves a range of draw pixel heights: two
+requested heights that share a bake bucket produce a byte-identical bitmap and
+identical glyph UVs, while their draw-size geometry differs.
+
+Convert baked data to a specific draw pixel height with the scaling helpers:
+
+- `scaled_glyph(atlas, glyph, draw_pixel_height)` returns a `scaled_glyph_t` with
+  the output-pixel `advance_x`, baseline-relative `plane_*` rectangle, and UVs.
+  Non-visible glyphs (for example U+0020) scale to a degenerate zero-area plane
+  while still carrying `advance_x`.
+- `px_range_for_pixel_height` is the shader distance range in output pixels,
+  including `sharpness_bias`.
+- `scaled_font_metrics` returns ascender, descender, line height, and em size in
+  output pixels.
+
+The layout and measurement entry points (`measure_text_advance_px`,
+`for_each_positioned_glyph`, `measure_text_bounds_px`, `append_text_quads`) each
+take a `draw_pixel_height` and apply this scaling internally.
+
 Build results use `Build_status`:
 
 - `SUCCESS`: every valid requested codepoint was emitted.
@@ -45,10 +71,12 @@ the atlas ran out of space.
   missing codepoints.
 - `FAIL_BUILD`: fail the build when any valid requested codepoint is missing.
 
-`atlas_t::font_metrics` exposes ascender, descender, line height, and em size in
-output pixels. A baseline-to-descender-bottom offset can be computed as
-`-atlas.font_metrics.descender`. `zero_advance_px` is the advance of glyph `0`
-when available; it is a reference advance, not proof that the font is monospace.
+`atlas_t::font_metrics_units` exposes ascender, descender, line height, and em
+size in font units; `scaled_font_metrics(atlas, draw_pixel_height)` returns the
+same metrics in output pixels. A baseline-to-descender-bottom offset for a draw
+height is `-scaled_font_metrics(atlas, draw_pixel_height).descender`.
+`atlas_t::zero_advance_units` is the font-unit advance of glyph `0` when
+available; it is a reference advance, not proof that the font is monospace.
 
 `default_codepoints()` is a UI-oriented scalar set covering printable ASCII,
 selected Latin, Greek, currency, and UI symbol codepoints. It includes U+FFFD so
@@ -68,12 +96,13 @@ Atlas data is row-major RGBA8. Row 0 is the first row in memory, and the UV `t`
 coordinate increases downward to match that layout. Upload the texture as
 linear data, not sRGB.
 
-`options_t::atlas_px_range` is the baked distance range in atlas pixels.
-Internally, it is converted to shape units for msdfgen. `atlas_t::px_range` is
-the output-pixel distance range intended for shader reconstruction after build
-scaling and `sharpness_bias` are applied. `options_t::atlas_gutter_px` controls
-empty pixels between packed glyph bitmaps. Shaders should still clamp sampling
-to the glyph UV rectangle when using linear filtering.
+`options_t::atlas_px_range` is the baked distance range in atlas pixels, retained
+on the atlas as `atlas_t::atlas_px_range`. The output-pixel distance range
+intended for shader reconstruction is produced per draw height by
+`px_range_for_pixel_height(atlas, draw_pixel_height)`, which applies the draw
+scaling and `sharpness_bias`. `options_t::atlas_gutter_px` controls empty pixels
+between packed glyph bitmaps. Shaders should still clamp sampling to the glyph UV
+rectangle when using linear filtering.
 
 Text layout is single-line, left-to-right codepoint layout with optional
 kerning. It does not perform HarfBuzz shaping, bidirectional reordering,

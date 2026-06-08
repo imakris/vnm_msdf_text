@@ -258,13 +258,58 @@ struct Emitted_glyph
     msdfgen::GlyphIndex glyph_index;
 };
 
+struct Draw_scaling
+{
+    double draw_scale = 0.0;
+    // atlas_px_range * screen_to_atlas_ratio, in output pixels: the symmetric
+    // padding added around the glyph outline bounds at the draw size.
+    double pad = 0.0;
+};
+
+Draw_scaling draw_scaling_for(const atlas_t& atlas, int draw_pixel_height)
+{
+    const double ascender = atlas.font_metrics_units.ascender;
+    const double draw_scale = (ascender > 0.0)
+        ? static_cast<double>(draw_pixel_height) / ascender
+        : 0.0;
+    const double screen_to_atlas_ratio = (atlas.bitmap_scale > 0.0)
+        ? draw_scale / atlas.bitmap_scale
+        : 0.0;
+    return Draw_scaling{draw_scale, atlas.atlas_px_range * screen_to_atlas_ratio};
+}
+
+scaled_glyph_t scale_glyph_with(const glyph_t& glyph, const Draw_scaling& scaling)
+{
+    scaled_glyph_t scaled;
+    scaled.advance_x = static_cast<float>(glyph.advance_units * scaling.draw_scale);
+    scaled.uv_left   = glyph.uv_left;
+    scaled.uv_bottom = glyph.uv_bottom;
+    scaled.uv_right  = glyph.uv_right;
+    scaled.uv_top    = glyph.uv_top;
+    // Only visible glyphs gain the padded plane rectangle. Advance-only glyphs
+    // such as U+0020 stay degenerate so they emit no quad after scaling.
+    if (glyph.visible) {
+        scaled.plane_left = static_cast<float>(
+            glyph.bounds_left_units * scaling.draw_scale - scaling.pad);
+        scaled.plane_right = static_cast<float>(
+            glyph.bounds_right_units * scaling.draw_scale + scaling.pad);
+        scaled.plane_top = static_cast<float>(
+            -glyph.bounds_bottom_units * scaling.draw_scale + scaling.pad);
+        scaled.plane_bottom = static_cast<float>(
+            -glyph.bounds_top_units * scaling.draw_scale - scaling.pad);
+    }
+    return scaled;
+}
+
 template <class Visitor>
 float for_each_positioned_glyph_impl(
     const atlas_t& atlas,
+    int draw_pixel_height,
     std::string_view text,
     float start_x,
     Visitor&& visit)
 {
+    const Draw_scaling scaling = draw_scaling_for(atlas, draw_pixel_height);
     float pen_x = start_x;
     char32_t previous = 0;
     const char* it = text.data();
@@ -277,13 +322,14 @@ float for_each_positioned_glyph_impl(
         }
         if (previous != 0) {
             const auto kerning_it =
-                atlas.kerning_px.find(make_kerning_key(previous, codepoint));
-            if (kerning_it != atlas.kerning_px.end()) {
-                pen_x += kerning_it->second;
+                atlas.kerning_units.find(make_kerning_key(previous, codepoint));
+            if (kerning_it != atlas.kerning_units.end()) {
+                pen_x += static_cast<float>(kerning_it->second * scaling.draw_scale);
             }
         }
-        visit(codepoint, pen_x, glyph_it->second);
-        pen_x += glyph_it->second.advance_x;
+        const scaled_glyph_t scaled = scale_glyph_with(glyph_it->second, scaling);
+        visit(codepoint, pen_x, scaled);
+        pen_x += scaled.advance_x;
         previous = codepoint;
     }
     return pen_x;
@@ -369,7 +415,7 @@ std::string codepoints_to_utf8(std::span<const char32_t> codepoints)
 build_result_t build_font_atlas(
     const std::uint8_t* font_data,
     std::size_t font_size,
-    int pixel_height,
+    int draw_pixel_height,
     std::span<const char32_t> codepoints,
     const options_t& options,
     const log_callback_t& log_debug)
@@ -380,7 +426,7 @@ build_result_t build_font_atlas(
     if (font_size > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         return failure("Font data is too large for msdfgen");
     }
-    if (pixel_height <= 0) {
+    if (draw_pixel_height <= 0) {
         return failure("Font pixel height must be positive");
     }
     if (options.atlas_size <= 0) {
@@ -456,31 +502,17 @@ build_result_t build_font_atlas(
         return result;
     };
 
+    // The bitmap is baked at bitmap_scale (font units -> atlas pixels). All
+    // draw-size geometry (advances, plane rectangles, kerning, metrics, and the
+    // shader px_range) is derived from the baked font-unit data at draw time by
+    // the scaling helpers, so one baked atlas serves many draw pixel heights.
     const double atlas_px_range = options.atlas_px_range;
     const double bitmap_scale =
-        std::max(static_cast<double>(pixel_height), options.min_atlas_font_size) /
+        std::max(static_cast<double>(draw_pixel_height), options.min_atlas_font_size) /
         metrics.ascenderY;
-    const double draw_scale = static_cast<double>(pixel_height) / metrics.ascenderY;
-    const double screen_to_atlas_ratio = draw_scale / bitmap_scale;
-    if (!is_finite_positive(bitmap_scale) ||
-        !is_finite_positive(draw_scale) ||
-        !is_finite_positive(screen_to_atlas_ratio))
-    {
+    if (!is_finite_positive(bitmap_scale)) {
         return failure("Font scaling values are not finite and usable");
     }
-
-    const float output_px_range =
-        (static_cast<float>(atlas_px_range) * static_cast<float>(screen_to_atlas_ratio)) *
-        options.sharpness_bias;
-    if (!is_finite_positive(output_px_range)) {
-        return failure("MSDF output pixel range is not finite and usable");
-    }
-
-    font_metrics_px_t output_font_metrics;
-    output_font_metrics.ascender = static_cast<float>(metrics.ascenderY * draw_scale);
-    output_font_metrics.descender = static_cast<float>(metrics.descenderY * draw_scale);
-    output_font_metrics.line_height = static_cast<float>(metrics.lineHeight * draw_scale);
-    output_font_metrics.em_size = static_cast<float>(metrics.emSize * draw_scale);
 
     std::vector<Glyph_group> glyph_groups;
     glyph_groups.reserve(requested_codepoints.size());
@@ -532,10 +564,15 @@ build_result_t build_font_atlas(
     }
 
     atlas_t& atlas = result.atlas;
-    atlas.pixel_height = pixel_height;
+    atlas.baked_pixel_height = msdf_bake_pixel_height(draw_pixel_height, options);
     atlas.atlas_size = options.atlas_size;
-    atlas.px_range = output_px_range;
-    atlas.font_metrics = output_font_metrics;
+    atlas.atlas_px_range = atlas_px_range;
+    atlas.bitmap_scale = bitmap_scale;
+    atlas.sharpness_bias = options.sharpness_bias;
+    atlas.font_metrics_units.ascender = static_cast<float>(metrics.ascenderY);
+    atlas.font_metrics_units.descender = static_cast<float>(metrics.descenderY);
+    atlas.font_metrics_units.line_height = static_cast<float>(metrics.lineHeight);
+    atlas.font_metrics_units.em_size = static_cast<float>(metrics.emSize);
 
     if (atlas_byte_count > atlas.rgba.max_size()) {
         return fail_with_diagnostics("MSDF atlas storage exceeds vector capacity");
@@ -588,13 +625,14 @@ build_result_t build_font_atlas(
         if (height_em <= 0.0 || width_em <= 0.0) {
             if (advance > 0.0) {
                 glyph_t glyph;
-                glyph.advance_x = static_cast<float>(advance * draw_scale);
+                glyph.advance_units = static_cast<float>(advance);
+                glyph.visible = false;
                 for (char32_t codepoint : group.codepoints) {
                     atlas.glyphs.emplace(codepoint, glyph);
                     emitted_glyphs.push_back(Emitted_glyph{codepoint, group.glyph_index});
                     if (codepoint == static_cast<char32_t>('0')) {
-                        atlas.zero_advance_px = glyph.advance_x;
-                        atlas.zero_advance_available = glyph.advance_x > 0.0f;
+                        atlas.zero_advance_units = glyph.advance_units;
+                        atlas.zero_advance_available = glyph.advance_units > 0.0f;
                     }
                 }
             }
@@ -695,19 +733,12 @@ build_result_t build_font_atlas(
         }
 
         glyph_t glyph;
-        glyph.advance_x = static_cast<float>(job.advance * draw_scale);
-        glyph.plane_left =
-            static_cast<float>(
-                job.bounds.l * draw_scale - atlas_px_range * screen_to_atlas_ratio);
-        glyph.plane_right =
-            static_cast<float>(
-                job.bounds.r * draw_scale + atlas_px_range * screen_to_atlas_ratio);
-        glyph.plane_top =
-            static_cast<float>(
-                -job.bounds.b * draw_scale + atlas_px_range * screen_to_atlas_ratio);
-        glyph.plane_bottom =
-            static_cast<float>(
-                -job.bounds.t * draw_scale - atlas_px_range * screen_to_atlas_ratio);
+        glyph.advance_units       = static_cast<float>(job.advance);
+        glyph.bounds_left_units   = static_cast<float>(job.bounds.l);
+        glyph.bounds_bottom_units = static_cast<float>(job.bounds.b);
+        glyph.bounds_right_units  = static_cast<float>(job.bounds.r);
+        glyph.bounds_top_units    = static_cast<float>(job.bounds.t);
+        glyph.visible             = true;
 
         const double uv_width = width_em * bitmap_scale + 2.0 * atlas_px_range;
         const double uv_height = height_em * bitmap_scale + 2.0 * atlas_px_range;
@@ -721,8 +752,8 @@ build_result_t build_font_atlas(
             atlas.glyphs.emplace(codepoint, glyph);
             emitted_glyphs.push_back(Emitted_glyph{codepoint, job.glyph_index});
             if (codepoint == static_cast<char32_t>('0')) {
-                atlas.zero_advance_px = glyph.advance_x;
-                atlas.zero_advance_available = glyph.advance_x > 0.0f;
+                atlas.zero_advance_units = glyph.advance_units;
+                atlas.zero_advance_available = glyph.advance_units > 0.0f;
             }
         }
 
@@ -740,11 +771,11 @@ build_result_t build_font_atlas(
                         left.glyph_index,
                         right.glyph_index))
                 {
-                    const float kern_px = static_cast<float>(k * draw_scale);
-                    if (kern_px != 0.0f) {
-                        atlas.kerning_px.emplace(
+                    const float kern_units = static_cast<float>(k);
+                    if (kern_units != 0.0f) {
+                        atlas.kerning_units.emplace(
                             make_kerning_key(left.codepoint, right.codepoint),
-                            kern_px);
+                            kern_units);
                     }
                 }
             }
@@ -768,38 +799,88 @@ build_result_t build_font_atlas(
     return result;
 }
 
-float measure_text_advance_px(const atlas_t& atlas, std::string_view text)
+int msdf_bake_pixel_height(int draw_pixel_height, const options_t& options)
+{
+    return std::max(
+        draw_pixel_height,
+        static_cast<int>(std::ceil(options.min_atlas_font_size)));
+}
+
+float px_range_for_pixel_height(const atlas_t& atlas, int draw_pixel_height)
+{
+    // draw_scaling_for() computes pad == atlas_px_range * screen_to_atlas_ratio,
+    // so the shader range is the symmetric plane padding scaled by the sharpness
+    // bias. Deriving it from the same draw-scaling core keeps one canonical
+    // implementation of the draw-size projection.
+    return static_cast<float>(
+        draw_scaling_for(atlas, draw_pixel_height).pad *
+        static_cast<double>(atlas.sharpness_bias));
+}
+
+scaled_glyph_t scaled_glyph(
+    const atlas_t& atlas,
+    const glyph_t& glyph,
+    int draw_pixel_height)
+{
+    return scale_glyph_with(glyph, draw_scaling_for(atlas, draw_pixel_height));
+}
+
+font_metrics_px_t scaled_font_metrics(const atlas_t& atlas, int draw_pixel_height)
+{
+    const double draw_scale = draw_scaling_for(atlas, draw_pixel_height).draw_scale;
+    font_metrics_px_t metrics;
+    metrics.ascender =
+        static_cast<float>(atlas.font_metrics_units.ascender * draw_scale);
+    metrics.descender =
+        static_cast<float>(atlas.font_metrics_units.descender * draw_scale);
+    metrics.line_height =
+        static_cast<float>(atlas.font_metrics_units.line_height * draw_scale);
+    metrics.em_size =
+        static_cast<float>(atlas.font_metrics_units.em_size * draw_scale);
+    return metrics;
+}
+
+float measure_text_advance_px(
+    const atlas_t& atlas,
+    int draw_pixel_height,
+    std::string_view text)
 {
     return for_each_positioned_glyph_impl(
-        atlas, text, 0.0f,
-        [](char32_t, float, const glyph_t&) {});
+        atlas, draw_pixel_height, text, 0.0f,
+        [](char32_t, float, const scaled_glyph_t&) {});
 }
 
 float for_each_positioned_glyph(
     const atlas_t& atlas,
+    int draw_pixel_height,
     std::string_view text,
     float start_x,
     const layout_callback_t& callback)
 {
     return for_each_positioned_glyph_impl(
         atlas,
+        draw_pixel_height,
         text,
         start_x,
-        [&](char32_t codepoint, float pen_x, const glyph_t& glyph) {
+        [&](char32_t codepoint, float pen_x, const scaled_glyph_t& glyph) {
             if (callback) {
-                callback(positioned_glyph_t{codepoint, &glyph, pen_x});
+                callback(positioned_glyph_t{codepoint, glyph, pen_x});
             }
         });
 }
 
-text_bounds_t measure_text_bounds_px(const atlas_t& atlas, std::string_view text)
+text_bounds_t measure_text_bounds_px(
+    const atlas_t& atlas,
+    int draw_pixel_height,
+    std::string_view text)
 {
     text_bounds_t bounds;
     bounds.advance_x = for_each_positioned_glyph_impl(
         atlas,
+        draw_pixel_height,
         text,
         0.0f,
-        [&](char32_t, float pen_x, const glyph_t& glyph) {
+        [&](char32_t, float pen_x, const scaled_glyph_t& glyph) {
             if (glyph.plane_left == glyph.plane_right ||
                 glyph.plane_bottom == glyph.plane_top)
             {
@@ -830,6 +911,7 @@ text_bounds_t measure_text_bounds_px(const atlas_t& atlas, std::string_view text
 
 void append_text_quads(
     const atlas_t& atlas,
+    int draw_pixel_height,
     std::string_view text,
     float x,
     float y,
@@ -846,8 +928,8 @@ void append_text_quads(
     }
 
     for_each_positioned_glyph_impl(
-        atlas, text, x,
-        [&](char32_t, float pen_x, const glyph_t& glyph) {
+        atlas, draw_pixel_height, text, x,
+        [&](char32_t, float pen_x, const scaled_glyph_t& glyph) {
             if (glyph.plane_left == glyph.plane_right ||
                 glyph.plane_bottom == glyph.plane_top)
             {
