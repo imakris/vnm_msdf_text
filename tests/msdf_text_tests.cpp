@@ -632,6 +632,39 @@ bool test_visible_glyph_has_coverage()
     return ok;
 }
 
+bool test_bake_bucket_rule()
+{
+    msdf::options_t options;
+    options.min_atlas_font_size = 48.0;
+
+    bool ok = true;
+    // Draw heights at or below the floor share one bake bucket. A renderer keys
+    // its baked atlas on this height, so equal results are a same-bucket cache hit
+    // (reuse across zoom) and unequal results are a cross-bucket miss (rebuild).
+    ok &= check(
+        msdf::msdf_bake_pixel_height(12, options) == 48,
+        "a sub-floor draw height bakes at ceil(min_atlas_font_size)");
+    ok &= check(
+        msdf::msdf_bake_pixel_height(48, options) == 48,
+        "a draw height at the floor bakes at the floor");
+    ok &= check(
+        msdf::msdf_bake_pixel_height(12, options) ==
+            msdf::msdf_bake_pixel_height(24, options),
+        "two sub-floor draw heights map to one bake bucket (same-bucket hit)");
+    ok &= check(
+        msdf::msdf_bake_pixel_height(72, options) == 72,
+        "an above-floor draw height bakes at the draw size");
+    ok &= check(
+        msdf::msdf_bake_pixel_height(48, options) !=
+            msdf::msdf_bake_pixel_height(72, options),
+        "crossing the floor maps to different bake buckets (cross-bucket miss)");
+    ok &= check(
+        msdf::msdf_bake_pixel_height(72, options) !=
+            msdf::msdf_bake_pixel_height(96, options),
+        "distinct above-floor draw heights map to distinct bake buckets");
+    return ok;
+}
+
 bool run_test(const char* name, bool (*test)())
 {
     try {
@@ -669,5 +702,6 @@ int main()
     ok &= run_test("scaled geometry is linear in draw height", test_scaled_geometry_is_linear_in_draw_height);
     ok &= run_test("space is advance-only after scaling", test_space_is_advance_only_after_scaling);
     ok &= run_test("visible glyph has coverage", test_visible_glyph_has_coverage);
+    ok &= run_test("bake bucket rule", test_bake_bucket_rule);
     return ok ? 0 : 1;
 }
