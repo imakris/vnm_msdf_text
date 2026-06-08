@@ -128,6 +128,19 @@ elseif(VNM_MSDF_TEXT_FETCH_DEPS)
   FetchContent_MakeAvailable(freetype)
   vnm_msdf_text_alias_freetype_target()
 
+  # The fetched FreeType is linked statically into consumers. On ELF platforms a
+  # consumer executable that also links Qt's FreeType (Qt's font engine on
+  # X11/Wayland) would otherwise export these symbols from its dynamic symbol
+  # table and interpose Qt's FreeType, corrupting Qt glyph loading (FT_Load_Glyph
+  # fails with err=7). Hide the bundled FreeType symbols so they never leak into a
+  # consumer's global symbol table. MSVC has no symbol interposition and ignores
+  # these properties.
+  if(TARGET freetype)
+    set_target_properties(freetype PROPERTIES
+      C_VISIBILITY_PRESET hidden
+      VISIBILITY_INLINES_HIDDEN ON)
+  endif()
+
   if(NOT TARGET Freetype::Freetype)
     message(FATAL_ERROR
       "vnm_msdf_text: FreeType was fetched, but target "
