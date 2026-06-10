@@ -160,8 +160,11 @@ struct options_t
     float atlas_px_range = 2.0f;
     /**
      * @brief Multiplier applied to the draw-size px_range for shader sharpness.
+     *
+     * 1.0 yields a one-output-pixel anti-aliasing ramp at every draw size;
+     * larger values sharpen the edge proportionally.
      */
-    float sharpness_bias = 2.5f;
+    float sharpness_bias = 1.0f;
     /**
      * @brief Empty atlas pixels left between packed glyph bitmaps.
      *

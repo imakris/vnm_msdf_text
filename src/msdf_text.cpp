@@ -716,7 +716,18 @@ build_result_t build_font_atlas(
             -job.bounds.l + (atlas_px_range / bitmap_scale),
             -job.bounds.b + (atlas_px_range / bitmap_scale));
         const msdfgen::Projection projection(msdf_scale, msdf_translate);
-        msdfgen::generateMTSDF(bitmap, job.shape, projection, options.atlas_px_range);
+        // msdfgen's range parameter is in shape units while atlas_px_range is
+        // calibrated in atlas pixels (px_range_for_pixel_height() decodes the
+        // texel slope as 1/atlas_px_range per atlas pixel), so convert through
+        // bitmap_scale. Passing atlas pixels directly made the encoded distance
+        // slope font-dependent: faces with a small font-unit ascender (legacy
+        // CJK fonts with unitsPerEm 256, e.g. MS Gothic and SimSun) baked SDFs
+        // so shallow that every edge decoded as a multi-pixel gray ramp.
+        msdfgen::generateMTSDF(
+            bitmap,
+            job.shape,
+            projection,
+            options.atlas_px_range / bitmap_scale);
 
         for (int y = 0; y < job.bitmap_h; ++y) {
             for (int x = 0; x < job.bitmap_w; ++x) {
