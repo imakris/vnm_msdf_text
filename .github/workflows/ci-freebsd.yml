@@ -1,0 +1,35 @@
+name: CI FreeBSD
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: FreeBSD 15.0
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build and test
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.0"
+          usesh: true
+          prepare: |
+            pkg update -f
+            pkg install -y cmake ninja pkgconf git
+          run: |
+            cmake -S . -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DVNM_MSDF_TEXT_BUILD_TESTS=ON \
+              -DVNM_MSDF_TEXT_FETCH_DEPS=ON
+            cmake --build build --config Release
+            ctest --test-dir build --output-on-failure
